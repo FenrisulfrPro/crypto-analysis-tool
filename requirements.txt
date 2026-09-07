@@ -1,0 +1,5 @@
+PySide6>=6.6
+gmssl>=3.2.2
+scapy>=2.6
+cryptography>=42
+matplotlib>=3.8

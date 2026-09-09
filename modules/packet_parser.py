@@ -187,7 +187,10 @@ SSH_SERVER_MARKERS = (
 
 
 def parse_ssh_kexinit(msg: bytes) -> OrderedDict:
-    """SSH_MSG_KEXINIT(20)：cookie + 10 个 name-list（算法协商）。"""
+    """SSH_MSG_KEXINIT(20)：cookie + 10 个 name-list（算法协商）。
+
+    列表字段输出两版：`label` 为完整逗号串（供协商计算与展示），
+    `label_list` 为逐项清单（供时序图卡片多行展示，不截断）。"""
     d = OrderedDict()
     if len(msg) < 17:
         return d
@@ -208,7 +211,8 @@ def parse_ssh_kexinit(msg: bytes) -> OrderedDict:
             d[label] = "(空)"
             continue
         items = [x.decode('utf-8', 'replace') for x in val.split(b",") if x]
-        d[label] = ", ".join(items[:10]) + (" ...（共 %d 项）" % len(items) if len(items) > 10 else "")
+        d[label] = ", ".join(items)
+        d[label + "_list"] = " | ".join(items)
     return d
 
 
@@ -239,6 +243,88 @@ def _ts_at(tsmap, off):
     return ts
 
 
+def parse_ssh_kexdh_init(msg: bytes) -> OrderedDict:
+    """SSH_MSG_KEXDH_INIT(30)：string e（客户端椭圆曲线公钥 / 交换值）。"""
+    d = OrderedDict()
+    d["消息"] = "SSH_MSG_KEXDH_INIT"
+    off = 1
+    if off + 4 <= len(msg):
+        n = int.from_bytes(msg[off:off + 4], "big")
+        off += 4
+        e = msg[off:off + n]
+        d["客户端交换值"] = e.hex().upper() if e else "(空)"
+        d["交换值长度"] = "%d 字节" % len(e)
+        if len(e) >= 32:
+            d["客户端交换值"] = e.hex().upper()
+    d["载荷长度"] = "%d 字节" % (len(msg) - 1)
+    return d
+
+
+def parse_ssh_kexdh_reply(msg: bytes) -> OrderedDict:
+    """SSH_MSG_KEXDH_REPLY(31)：string K_S（主机密钥）｜string f（服务端交换值）｜
+    string 签名（含签名算法名与签名值）。"""
+    d = OrderedDict()
+    d["消息"] = "SSH_MSG_KEXDH_REPLY"
+    off = 1
+
+    def _rs():
+        nonlocal off
+        if off + 4 > len(msg):
+            raise ValueError("KEXDH_REPLY 截断")
+        n = int.from_bytes(msg[off:off + 4], "big")
+        off += 4
+        v = msg[off:off + n]
+        off += n
+        return v
+
+    try:
+        ks = _rs()
+        f = _rs()
+        sig = _rs()
+        d["服务端主机密钥"] = ks.hex().upper() if ks else "(空)"
+        d["服务端主机密钥长度"] = "%d 字节" % len(ks)
+        # K_S 首串即主机密钥算法格式（如 ssh-rsa / ssh-ed25519）
+        if len(ks) >= 4:
+            kn = int.from_bytes(ks[:4], "big")
+            if 4 + kn <= len(ks) and kn > 0:
+                fmt = ks[4:4 + kn].decode('utf-8', 'replace')
+                d["服务端主机密钥格式"] = fmt
+        d["服务端交换值"] = f.hex().upper() if f else "(空)"
+        if len(sig) >= 4:
+            n = int.from_bytes(sig[:4], "big")
+            algo = sig[4:4 + n]
+            if algo:
+                d["服务端签名算法"] = algo.decode('utf-8', 'replace')
+                raw = sig[4 + n:]
+                # 部分实现签名内还带一层 mpint 长度前缀
+                if len(raw) >= 4:
+                    sn = int.from_bytes(raw[:4], "big")
+                    if 0 < sn == len(raw) - 4:
+                        raw = raw[4:]
+                d["服务端签名值"] = raw.hex().upper() if raw else "(空)"
+        d["载荷长度"] = "%d 字节" % (len(msg) - 1)
+    except Exception as e:
+        d["错误"] = str(e)
+    return d
+
+
+def _frame_ranges(nums):
+    """把帧号列表压成 Wireshark 式范围串，如 '16..39 46..48 51..53 55..57'。"""
+    nums = sorted(set(int(n) for n in nums if n is not None))
+    if not nums:
+        return ""
+    out = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        out.append("%d..%d" % (start, prev) if start != prev else str(start))
+        start = prev = n
+    out.append("%d..%d" % (start, prev) if start != prev else str(start))
+    return " ".join(out)
+
+
 def parse_ssh_stream(data: bytes, direction: str, segs=None, base=0, tsmap=None):
     """解析一条方向上重组的 SSH 流，返回消息列表。data 可含版本行 + 二进制包。
 
@@ -262,8 +348,22 @@ def parse_ssh_stream(data: bytes, direction: str, segs=None, base=0, tsmap=None)
         if mt == 20:
             fd = parse_ssh_kexinit(payload)
             fd["timestamp"] = (str(ts) if ts is not None else "")
+            kx = (fd.get("kex_algorithms") or "").split(",")[0]
             msgs.append({"dir": direction, "proto": "SSH", "type": "SSH_MSG_KEXINIT",
-                         "summary": "算法协商（kex=%s…）" % str(fd.get("kex_algorithms", ""))[:40],
+                         "summary": "算法协商（首选 kex=%s）" % kx,
+                         "ts": ts, "no": pno, "fields": fd})
+        elif mt == 30:
+            fd = parse_ssh_kexdh_init(payload)
+            ev = fd.get("客户端交换值", "")
+            msgs.append({"dir": direction, "proto": "SSH", "type": "SSH_MSG_KEXDH_INIT",
+                         "summary": "客户端密钥交换（交换值 %s…）" % ev[:24],
+                         "ts": ts, "no": pno, "fields": fd})
+        elif mt == 31:
+            fd = parse_ssh_kexdh_reply(payload)
+            alg = fd.get("服务端签名算法") or "?"
+            sig = fd.get("服务端签名值") or ""
+            msgs.append({"dir": direction, "proto": "SSH", "type": "SSH_MSG_KEXDH_REPLY",
+                         "summary": "服务端密钥交换（签名算法=%s，签名值 %s…）" % (alg, sig[:24]),
                          "ts": ts, "no": pno, "fields": fd})
         else:
             nm = SSH_MSG_NAME.get(mt, "SSH_MSG_%d" % mt)
@@ -332,35 +432,84 @@ def _kex_list(value):
     return [x for x in items if x]
 
 
-def _ssh_negotiation_message(msgs, cdir_txt):
-    """当客户端与服务端的 SSH_MSG_KEXINIT 都解析出来时，计算双端最终选定的算法，
-    生成一条“SSH 协商算法”综合消息插入时序图。cdir_txt 为客户端方向（'A->B'/'B->A'）。"""
+def _ssh_negotiation_summary(msgs, cdir_txt, stream_no=None, frames=None):
+    """生成一条“SSH 协商算法”综合消息插入时序图（每个 SSH 流都有，含不完整流）。
+
+    汇总：SSH 版本 / 会话完整状态 / 双端最终选定算法 / 服务端支持的算法 /
+    密钥协商参数（客户端交换值、服务端交换值、服务端签名算法、服务端签名值）/
+    Wireshark 定位（tcp.stream、精确帧过滤器、帧数量）。
+    cdir_txt 为客户端方向（'A->B'/'B->A'）。"""
+    if not msgs:
+        return None
     ck = next((m for m in msgs if m.get("dir") == cdir_txt and m.get("type") == "SSH_MSG_KEXINIT"), None)
     sk = next((m for m in msgs if m.get("dir") != cdir_txt and m.get("type") == "SSH_MSG_KEXINIT"), None)
-    if not ck or not sk:
-        return None
-    nos = [x for x in (ck.get("no"), sk.get("no")) if x is not None]
-    no = max(nos) if nos else None
-    cfd = ck.get("fields") or {}
-    sfd = sk.get("fields") or {}
+    newkeys_c = any(m.get("type") == "SSH_MSG_NEWKEYS" and m.get("dir") == cdir_txt for m in msgs)
+    newkeys_s = any(m.get("type") == "SSH_MSG_NEWKEYS" and m.get("dir") != cdir_txt for m in msgs)
+    complete = bool(ck and sk and newkeys_c and newkeys_s)
+
     fd = OrderedDict()
-    for field, name in _NEG_FIELDS:
-        cl = _kex_list(cfd.get(field))
-        sl = _kex_list(sfd.get(field))
-        sel = next((x for x in cl if x in sl), "") if cl else ""
-        fd[name] = sel or "（未匹配）"
-    kex = fd.get("密钥交换方法 (kex)", "")
-    enc = fd.get("加密算法 c→s", "")
-    mac = fd.get("MAC 算法 c→s", "")
-    comp = fd.get("压缩算法 c→s", "")
+    vers = [(m.get("fields") or {}).get("version_line", "") for m in msgs if m.get("type") == "SSH 版本交换"]
+    fd["SSH 版本"] = "SSH 2.0" if any("2.0" in str(v) for v in vers) else (vers[0] if vers else "SSH")
+    fd["会话状态"] = "完整" if complete else "不完整"
+
+    if ck and sk:
+        ckv = ck.get("fields") or {}
+        skv = sk.get("fields") or {}
+        for field, name in _NEG_FIELDS:
+            cl = _kex_list(ckv.get(field))
+            sl = _kex_list(skv.get(field))
+            fd[name] = next((x for x in cl if x in sl), "-") if cl else "-"
+
+        def _sup(field):
+            return " | ".join(_kex_list(skv.get(field))) or "-"
+
+        fd["服务端支持·密钥交换算法"] = _sup("kex_algorithms")
+        fd["服务端支持·加密算法"] = _sup("encryption s->c")
+        fd["服务端支持·完整性算法"] = _sup("mac s->c")
+    else:
+        for _f, name in _NEG_FIELDS:
+            fd[name] = "-"
+        # 不完整会话（缺客户端 KEXINIT）：以服务端 KEXINIT 首选主机密钥算法作“服务端签名”最佳估计
+        if sk:
+            hk = _kex_list((sk.get("fields") or {}).get("server_host_key_algorithms"))
+            if hk:
+                fd["主机密钥算法 (host key)"] = hk[0]
+
+    init = next((m for m in msgs if m.get("type") == "SSH_MSG_KEXDH_INIT"), None)
+    rep = next((m for m in msgs if m.get("type") == "SSH_MSG_KEXDH_REPLY"), None)
+    fd["客户端交换值"] = (init.get("fields") or {}).get("客户端交换值") or "-" if init else "-"
+    if rep:
+        rf = rep.get("fields") or {}
+        fd["服务端交换值"] = rf.get("服务端交换值") or "-"
+        fd["服务端主机密钥"] = rf.get("服务端主机密钥") or "-"
+        fd["服务端主机密钥格式"] = rf.get("服务端主机密钥格式") or "-"
+        fd["服务端签名算法"] = rf.get("服务端签名算法") or "-"
+        fd["服务端签名值"] = rf.get("服务端签名值") or "-"
+    else:
+        fd["服务端交换值"] = "-"
+        fd["服务端主机密钥"] = "-"
+        fd["服务端主机密钥格式"] = "-"
+        fd["服务端签名算法"] = "-"
+        fd["服务端签名值"] = "-"
+
+    if stream_no is not None:
+        fd["会话过滤器"] = "tcp.stream == %d" % stream_no
+    if frames:
+        fd["精确帧过滤器"] = "frame.number in {%s}" % _frame_ranges(frames)
+        fd["帧数量"] = "%d" % len(frames)
+
+    nos = [m.get("no") for m in msgs if m.get("no") is not None]
+    no = max(nos) if nos else None
+    kex = fd.get("密钥交换方法 (kex)") or "-"
+    enc = fd.get("加密算法 c→s") or "-"
+    mac = fd.get("MAC 算法 c→s") or "-"
+    hk = fd.get("主机密钥算法 (host key)") or "-"
     return {
         "dir": cdir_txt, "proto": "SSH", "type": "SSH 协商算法",
-        "summary": "选定：kex=%s，加密=%s，MAC=%s，压缩=%s（取客户端列表中双方共有首项）"
-                   % (kex or "?", enc or "?", mac or "?", comp or "?"),
+        "summary": "%s · %s：密钥交换=%s，加密=%s，完整性=%s，服务端签名=%s"
+                   % (fd.get("SSH 版本"), fd.get("会话状态"), kex, enc, mac, hk),
         "no": no, "ts": None,
-        "fields": OrderedDict(
-            [("协商规则", "RFC 4253：取客户端偏好列表中服务端亦支持的第一项")]
-            + list(fd.items())),
+        "fields": fd,
     }
 
 
@@ -407,8 +556,9 @@ def parse_tls_packet(payload: bytes) -> OrderedDict:
                            fields.get("cert1_sig_algorithm")))
                     # Certificate：签名值 / 公钥等关键字段单独展开，便于直接查看
                     for fk, fv in fields.items():
-                        fvs = str(fv)
-                        d["    ├ %s" % fk] = (fvs[:1200] + "…") if len(fvs) > 1200 else fvs
+                        if fk == "der_hex":
+                            continue
+                        d["    ├ %s" % fk] = str(fv)
                 else:
                     d["  握手 %d: %s" % (handshake_count, mname)] = _tl._summary_for(mt, fields)
     # 检查尾巴是否可能是跨包记录
@@ -560,6 +710,20 @@ def analyze_streams(pkts) -> dict:
     """
     flows = dict(_tl.analyze_flows(pkts)["flows"])
     raw_flows = _tl._reassemble_flows(pkts)
+    # Wireshark 式 tcp.stream 编号 + 每流全部 TCP 帧号（按抓包顺序）
+    stream_idx = {}
+    stream_frames = {}
+    for i, p in enumerate(pkts):
+        try:
+            k = _tl._flow_key(p)
+        except Exception:
+            continue
+        if k is None:
+            continue
+        if k not in stream_idx:
+            stream_idx[k] = len(stream_idx)
+            stream_frames[k] = []
+        stream_frames[k].append(i + 1)
     for key, f in raw_flows.items():
         if key in flows:
             continue
@@ -578,13 +742,17 @@ def analyze_streams(pkts) -> dict:
                 cdir_txt = "A->B" if ssh_client_direction(f) == "ab" else "B->A"
                 if cdir_txt == "B->A":
                     client, server = server, client
-                # 双向 KEXINIT 齐备时，把双端选定的密码算法作为一条消息插入时序
-                neg = _ssh_negotiation_message(msgs, cdir_txt)
+                # 生成“SSH 协商算法”综合消息（含完整状态/选定算法/服务端支持/协商参数/定位）
+                neg = _ssh_negotiation_summary(msgs, cdir_txt,
+                                               stream_idx.get(key), stream_frames.get(key))
                 if neg is not None:
                     msgs.append(neg)
                     msgs.sort(key=lambda m: m.get("no") if m.get("no") is not None else 1 << 30)
                 flows[key] = {"client": client, "server": server,
-                              "proto": "SSH", "messages": msgs}
+                              "proto": "SSH", "cdir": cdir_txt,
+                              "stream": stream_idx.get(key),
+                              "frames": stream_frames.get(key),
+                              "messages": msgs}
     return flows
 
 

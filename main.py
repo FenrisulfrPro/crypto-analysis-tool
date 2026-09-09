@@ -806,7 +806,7 @@ class HandshakeView(QWidget):
     - 左右两侧全高彩色生命线：客户端天蓝 #93C5FD / 服务端淡红 #FCA5A5，端点标签 + 设备图标
     - 中央灰色时间轴；消息按发送方左右交替排布
     - 报文卡：客户端淡蓝 #EFF6FF / 服务端淡红 #FEF2F2 圆角卡 + 同色系外缘箭头
-      （卡内嵌白底分节箱：随机数时间字节高亮、最终选定密码套件加粗、
+      （卡内嵌白底分节箱：协议版本名（TLCP 1.0 / TLS 1.2）高亮、随机数按普通文本显示、
        「支持的密码套件：点击查看详情」提示）
     - 交错淡入上浮动画（framer-motion 风格，相邻卡延迟 STAGGER_MS）
     - 点击报文卡仍在下方「关键参数」面板展开完整字段（保持 eventClicked 信号）"""
@@ -1004,22 +1004,21 @@ class HandshakeView(QWidget):
 
     @staticmethod
     def _value_html(k, disp, s):
+        import re
         short = s.replace("\n", " ").strip()
         if len(short) > 96:
             short = short[:96] + "…"
         es = _html.escape(short)
         el = _html.escape(disp)
-        if "随机数" in disp:
-            import re
-            m = re.search(r"[A-Fa-f0-9]{16,}", short)
-            if m:
-                t = m.group(0)
-                pre = _html.escape(short[:m.start()])
-                post = _html.escape(short[m.end():])
-                inner = ("%s<span style='color:#2563eb;font-weight:bold'>%s</span>%s%s"
-                         % (pre, _html.escape(t[:8]), _html.escape(t[8:]), post))
-            else:
-                inner = "<b>%s</b>" % es
+        if "version" in str(k).lower() or "版本" in disp:
+            # 协议版本名（如 TLCP 1.0 / TLS 1.2）高亮，括号中的十六进制代码保持普通
+            m = re.match(r"^(.*?)(?=\s*\(|\s*（|$)", short)
+            name = m.group(1) if m else short
+            rest = short[len(name):]
+            inner = ("<b><span style='color:#2563eb'>%s</span></b>%s"
+                     % (_html.escape(name), _html.escape(rest)))
+        elif "随机数" in disp:
+            inner = es
         elif "最终选定密码套件" in disp or "选定" in disp:
             inner = "<b><span style='color:#2563eb'>%s</span></b>" % es
         elif "算法" in disp or "套件" in disp:
@@ -1411,12 +1410,14 @@ class HandshakeView(QWidget):
 
 # ============================================================ 详情弹窗（包 / 证书）
 _CERT_LABELS = {
-    "subject": "主体 (CN)",
-    "issuer": "签发者",
+    "version": "证书版本",
+    "serial": "序列号",
+    "subject": "使用者",
+    "issuer": "颁发者",
     "not_before": "有效期起",
     "not_after": "有效期止",
-    "serial": "序列号 (HEX)",
     "pubkey": "公钥算法",
+    "pubkey_curve": "公钥曲线",
     "sig_algorithm": "签名算法",
     "basic_constraints": "CA 约束 (BasicConstraints)",
     "ext_key_usage": "证书用途 (EKU)",
@@ -1466,7 +1467,8 @@ class SummaryDialog(QDialog):
 
 
 class CertDetailDialog(QDialog):
-    """证书详情窗口：展示单张证书的全部关键字段（点击时序图「证书 N」按钮弹出）。"""
+    """证书详情窗口：展示单张证书的全部关键字段（点击时序图「证书 N」按钮弹出），
+    并提供「导出证书 (.cer)」按钮把原始 DER 证书存到本地。"""
     def __init__(self, cert_index, fields, parent=None):
         super().__init__(parent)
         self.setWindowTitle("证书详情 · 第 %d 张" % cert_index)
@@ -1480,32 +1482,69 @@ class CertDetailDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#78909C; font-size:11px;")
         lay.addWidget(hint)
+
+        btnrow = QHBoxLayout()
+        btn_export = QPushButton("导出证书 (.cer)")
+        btn_export.setToolTip("把该证书按原始 DER 编码保存到本机（如 .cer 文件）")
+        btn_export.clicked.connect(lambda: self._export(fields))
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        btnrow.addWidget(btn_export)
+        btnrow.addStretch(1)
+        btnrow.addWidget(btn_close)
+        lay.addLayout(btnrow)
+
         txt = QPlainTextEdit()
         txt.setReadOnly(True)
         txt.setFont(QFont(MONO, 9))
         txt.setPlainText(self._format(fields))
         lay.addWidget(txt, 1)
         self.edit = txt
-        btn = QPushButton("关闭")
-        btn.clicked.connect(self.accept)
-        lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    @staticmethod
+    def _export(fields):
+        der_hex = fields.get("der_hex")
+        if not der_hex:
+            QMessageBox.information(None, "导出证书", "该证书未保留原始 DER 数据，无法导出")
+            return
+        from datetime import datetime
+        default = "cert_%s.cer" % (fields.get("serial") or
+                                   datetime.now().strftime("%Y%m%d%H%M%S"))
+        path, _ = QFileDialog.getSaveFileName(None, "保存证书", default,
+                                              "证书 (*.cer);;PEM (*.pem);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(bytes.fromhex(der_hex))
+            QMessageBox.information(None, "导出证书", "已导出到：\n%s" % path)
+        except Exception as e:
+            QMessageBox.critical(None, "导出证书", "导出失败：%s" % e)
 
     @staticmethod
     def _format(fields):
         lines = []
-        for k in ("subject", "issuer", "not_before", "not_after", "serial",
-                  "pubkey", "sig_algorithm", "basic_constraints",
-                  "ext_key_usage", "key_usage",
+        for k in ("version", "serial", "subject", "issuer"):
+            if k in fields:
+                lines.append("%s：%s" % (_CERT_LABELS.get(k, k), fields[k]))
+        nb, na = fields.get("not_before"), fields.get("not_after")
+        if nb and na:
+            lines.append("有效期：%s - %s" % (nb, na))
+        for k in ("sig_algorithm", "pubkey", "pubkey_curve", "key_usage",
+                  "ext_key_usage", "basic_constraints",
                   "sig_sha256", "sha256_thumb", "sig_value"):
-            if k not in fields:
-                continue
-            v = str(fields[k])
-            label = _CERT_LABELS.get(k, k)
-            lines.append("%s：%s" % (label, v))
+            if k in fields:
+                lines.append("%s：%s" % (_CERT_LABELS.get(k, k), fields[k]))
+        seen = {"version", "serial", "subject", "issuer", "not_before", "not_after",
+                "sig_algorithm", "pubkey", "pubkey_curve", "key_usage",
+                "ext_key_usage", "basic_constraints", "sig_sha256", "sha256_thumb",
+                "sig_value", "der_hex"}
         for k, v in fields.items():
-            if k in _CERT_LABELS:
+            if k in seen:
                 continue
-            lines.append("%s：%s" % (k, v))
+            if k == "der_hex":
+                continue
+            lines.append("%s：%s" % (_CERT_LABELS.get(k, k), v))
         return "\n".join(lines)
 
 
@@ -1955,9 +1994,9 @@ class PcapTab(QWidget):
         text_parts = []
         for grp, fields in tree.items():
             text_parts.append("== %s ==" % grp)
-            for k, v in fields.items():
-                sv = str(v)
-                text_parts.append("%s: %s" % (k, (sv[:400] + "…") if len(sv) > 400 else sv))
+        for k, v in fields.items():
+            sv = str(v)
+            text_parts.append("%s: %s" % (k, sv))
         body = "\n".join(text_parts)
         try:
             raw = bytes(pkt)
@@ -1976,7 +2015,7 @@ class PcapTab(QWidget):
             it = QTreeWidgetItem(["%s" % grp, "", ""])
             for k, v in fields.items():
                 sv = str(v)
-                shown = sv if len(sv) <= 240 else sv[:240] + "…"
+                shown = sv
                 child = QTreeWidgetItem([k, "", shown])
                 it.addChild(child)
                 self._detail_map[id(child)] = [(k, sv)]
@@ -1994,7 +2033,7 @@ class PcapTab(QWidget):
         lines = []
         for k, v in fields:
             sv = str(v)
-            lines.append("%s:\n  %s\n" % (k, (sv[:1200] + "…") if len(sv) > 1200 else sv))
+            lines.append("%s:\n  %s\n" % (k, sv))
         self.detail_edit.setPlainText("\n".join(lines))
 
     # ------------------------------------------------------------ 查看该 TCP 流

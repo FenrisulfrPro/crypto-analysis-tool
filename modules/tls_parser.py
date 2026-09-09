@@ -8,6 +8,7 @@
   - 解出 CertificateVerify / ServerKeyExchange / Finished 等签名与校验数据
 """
 import struct
+import re
 from collections import Counter, OrderedDict, defaultdict
 
 from scapy.all import rdpcap, IP, IPv6, TCP, UDP, ARP
@@ -437,16 +438,18 @@ def _parse_der_cert(der: bytes):
         return info
     try:
         c = x509.load_der_x509_certificate(der)
-        info["subject"] = c.subject.rfc4514_string()
-        info["issuer"] = c.issuer.rfc4514_string()
-        info["not_before"] = c.not_valid_before_utc.isoformat()
-        info["not_after"] = c.not_valid_after_utc.isoformat()
+        info["subject"] = _dn_attr_first_4514(c.subject.rfc4514_string())
+        info["issuer"] = _dn_attr_first_4514(c.issuer.rfc4514_string())
+        info["not_before"] = _fmt_cert_time(c.not_valid_before_utc)
+        info["not_after"] = _fmt_cert_time(c.not_valid_after_utc)
+        info["version"] = _cert_version_text(c.version)
         info["serial"] = "%X" % c.serial_number
-        info["sig_algorithm"] = c.signature_algorithm_oid._name or str(c.signature_algorithm_oid)
+        info["sig_algorithm"] = _alg_label(c.signature_algorithm_oid.dotted_string)
         info["pubkey"] = _fmt_pubkey(c.public_key())
         info["sha256_thumb"] = _sha256(der)
-        info["sig_value"] = _fmt_hex(c.signature, 80)
+        info["sig_value"] = c.signature.hex()
         info["sig_sha256"] = _sha256(c.signature)
+        info["der_hex"] = der.hex()
         # 证书用途（EKU）/ 密钥用途（KeyUsage）/ CA 约束：区分加密证书与签名证书
         exts = c.extensions
         try:
@@ -486,6 +489,73 @@ _OID_SHORT = {
     "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
 }
 
+# 签名算法 OID → 标准名字（固密签名见 GB/T 32918.3 / GM/T 0003.2，命名与 Bouncy Castle GMObjectIdentifiers 一致）
+_SIG_OID_NAMES = {
+    "1.2.156.10197.1.501": "SM3withSM2",
+    "1.2.156.10197.1.502": "SHA1withSM2",
+    "1.2.156.10197.1.503": "SHA256withSM2",
+    "1.2.156.10197.1.504": "SHA512withSM2",
+    "1.2.156.10197.1.505": "SHA224withSM2",
+    "1.2.156.10197.1.506": "SHA384withSM2",
+    "1.2.840.113549.1.1.5": "sha1WithRSAEncryption",
+    "1.2.840.113549.1.1.11": "sha256WithRSAEncryption",
+    "1.2.840.113549.1.1.12": "sha384WithRSAEncryption",
+    "1.2.840.113549.1.1.13": "sha512WithRSAEncryption",
+    "1.2.840.113549.1.1.14": "sha224WithRSAEncryption",
+    "1.2.840.10045.4.1": "ecdsa-with-SHA1",
+    "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+    "1.2.840.10045.4.3.3": "ecdsa-with-SHA384",
+    "1.2.840.10045.4.3.4": "ecdsa-with-SHA512",
+}
+
+
+def _alg_label(oid) -> str:
+    """签名/算法 OID → '名字（OID …）'；未收录的 OID 退化为原样。"""
+    oid = oid or ""
+    name = _SIG_OID_NAMES.get(oid) or _OID_SHORT.get(oid)
+    if name:
+        return "%s（OID %s）" % (name, oid)
+    return oid
+
+
+def _fmt_cert_time(dt) -> str:
+    """datetime → 'YYYY/M/D H:M:S'（本地时区；无前导零的月/日，参考工具表达）。"""
+    try:
+        local = dt.astimezone()
+        return "%d/%d/%d %02d:%02d:%02d" % (local.year, local.month, local.day,
+                                            local.hour, local.minute, local.second)
+    except Exception:
+        return str(dt)
+
+
+def _asn1_time_str(raw: bytes) -> str:
+    """X.509 UTCTime(YYMMDDHHMMSSZ) / GeneralizedTime(YYYYMMDDHHMMSSZ) → 本地 'YYYY/M/D H:M:S'。"""
+    s = raw.decode('ascii', 'replace').strip()
+    try:
+        from datetime import datetime, timezone
+        body = s.rstrip("Z")
+        if len(body) == 12:
+            dt = datetime.strptime(body, "%y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        elif len(body) == 14:
+            dt = datetime.strptime(body, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        else:
+            return s
+        return _fmt_cert_time(dt)
+    except Exception:
+        return s
+
+
+def _cert_version_text(ver) -> str:
+    """x509.Version / int → 'V1'/'V2'/'V3'。"""
+    try:
+        n = int(ver.value)
+    except Exception:
+        try:
+            n = int(ver)
+        except Exception:
+            return str(ver)
+    return {0: "V1", 1: "V2", 2: "V3"}.get(n, "V%d" % (n + 1))
+
 
 def _ber_tlv(data: bytes, off: int):
     """读取一个 BER/DER TLV，返回 (tag, value_bytes, next_off)。"""
@@ -522,6 +592,17 @@ def _val_to_str(tag: int, val: bytes) -> str:
     return val.hex()
 
 
+_DN_PRIORITY = {"CN": 0, "OU": 1, "O": 2, "L": 3, "ST": 4, "STREET": 5,
+                "C": 6, "emailAddress": 7}
+
+
+def _dn_attr_first(pairs):
+    """按展示优先级稳定排序 RDN（CN → OU → O → L → ST → C），
+    各 CA 的 DER 顺序（有的 CN 在前、有的 C 在前）统一成「CN 在前的常见展示顺序」。"""
+    pairs.sort(key=lambda x: _DN_PRIORITY.get(x[0], 9))
+    return ",".join(v for _, v in pairs)
+
+
 def _name_to_str(name_val: bytes) -> str:
     """Name ::= SEQUENCE OF RDN（RDN ::= SET OF AttributeTypeAndValue）→ rfc4514 样式。"""
     parts = []
@@ -535,8 +616,25 @@ def _name_to_str(name_val: bytes) -> str:
             oid = _ber_oid_str(oid_b)
             v_tag, v_bytes, _ = _ber_tlv(atv, o4)
             label = _OID_SHORT.get(oid, oid)
-            parts.append("%s=%s" % (label, _val_to_str(v_tag, v_bytes)))
-    return ",".join(parts)
+            parts.append((label, "%s=%s" % (label, _val_to_str(v_tag, v_bytes))))
+    return _dn_attr_first(parts)
+
+
+def _dn_attr_first_4514(s: str) -> str:
+    """把 RFC4514 DN 字符串重排为 CN 在前的展示顺序。
+    按 rfc4514 转义规则切分：前有反斜杠的逗号属于值内，不切断。"""
+    if not s:
+        return s
+    toks = re.split(r"(?<!\\),", s)
+    pairs = []
+    for t in toks:
+        if "=" in t:
+            lbl, val = t.split("=", 1)
+            pairs.append((lbl, t))
+        else:
+            pairs.append(("", t))
+    pairs.sort(key=lambda x: _DN_PRIORITY.get(x[0], 9))
+    return ",".join(v for _, v in pairs)
 
 
 def _alg_oid_of(alg_seq: bytes):
@@ -562,13 +660,31 @@ def _parse_der_loose(der: bytes) -> OrderedDict:
         _, sig_alg_seq, off = _ber_tlv(body, off)
         _, sig_bit, _ = _ber_tlv(body, off)
 
-        # TBS 内按序收集 SEQUENCE：signature, issuer, validity, subject, spki
+        # TBS：version [0] IMPLICIT（可选，V2/V3 才有）→ serial INTEGER → 其余 SEQUENCE
+        tbs_o = 0
+        d["version"] = "V1"
+        tg0, v0, tbs_o = _ber_tlv(tbs, tbs_o)
+        if tg0 == 0xA0:  # [0] version
+            try:
+                _, iv, _ = _ber_tlv(v0, 0)
+                n = int.from_bytes(iv, "big")
+                d["version"] = {0: "V1", 1: "V2", 2: "V3"}.get(n, "V%d" % (n + 1))
+            except Exception:
+                pass
+            tg0, v0, tbs_o = _ber_tlv(tbs, tbs_o)  # 随后的 serial
+        if tg0 == 0x02:
+            d["serial"] = "%X" % int.from_bytes(v0, "big")
+
+        # 其余按序收集 SEQUENCE：signature, issuer, validity, subject, spki；同时捕获 [3] extensions
         seqs = []
-        o = 0
+        ext_val = b""
+        o = tbs_o
         while o < len(tbs):
             tag, val, o = _ber_tlv(tbs, o)
             if tag == 0x30:
                 seqs.append(val)
+            elif tag == 0xA3:
+                ext_val = val
         sig_seq = seqs[0] if len(seqs) > 0 else b""
         issuer = seqs[1] if len(seqs) > 1 else b""
         validity = seqs[2] if len(seqs) > 2 else b""
@@ -582,14 +698,14 @@ def _parse_der_loose(der: bytes) -> OrderedDict:
             try:
                 _, nb, o2 = _ber_tlv(validity, 0)
                 _, na, _ = _ber_tlv(validity, o2)
-                d["not_before"] = nb.decode('ascii', 'replace')
-                d["not_after"] = na.decode('ascii', 'replace')
+                d["not_before"] = _asn1_time_str(nb)
+                d["not_after"] = _asn1_time_str(na)
             except Exception:
                 pass
         # 证书整体签名算法（TBS.sig 与 outer sig_alg 一般一致）
         sig_oid, _ = _alg_oid_of(sig_seq)
         outer_oid, _ = _alg_oid_of(sig_alg_seq)
-        d["sig_algorithm"] = _OID_SHORT.get(outer_oid or sig_oid, outer_oid or sig_oid)
+        d["sig_algorithm"] = _alg_label(outer_oid or sig_oid)
         # 公钥
         if spki:
             try:
@@ -604,23 +720,99 @@ def _parse_der_loose(der: bytes) -> OrderedDict:
                     except Exception:
                         pass
                 if alg_oid == "1.2.156.10197.1.301":
-                    d["pubkey"] = "SM2 国密公钥"
+                    d["pubkey"] = "SM2（椭圆曲线公钥密码算法）"
+                    d["pubkey_curve"] = "SM2（OID 1.2.156.10197.1.301，256 位）"
                 elif alg_oid == "1.2.840.10045.2.1":
                     if curve == "1.2.156.10197.1.301" or curve == "1.3.132.0.38":
-                        d["pubkey"] = "EC (SM2 国密曲线)"
+                        d["pubkey"] = "SM2（椭圆曲线公钥密码算法）"
+                        d["pubkey_curve"] = "SM2（OID %s，256 位）" % curve
                     else:
-                        d["pubkey"] = "EC (%s)" % (_OID_SHORT.get(curve, curve or "未知曲线"))
+                        d["pubkey"] = "ECC（椭圆曲线公钥算法 id-ecPublicKey）"
+                        d["pubkey_curve"] = "%s（OID %s）" % (_OID_SHORT.get(curve, curve or "未知曲线"), curve)
                 else:
-                    d["pubkey"] = "alg=%s" % _OID_SHORT.get(alg_oid, alg_oid)
+                    d["pubkey"] = "%s（OID %s）" % (_OID_SHORT.get(alg_oid, "未知算法"), alg_oid)
             except Exception:
                 pass
         # 签名值
         if sig_bit:
-            d["sig_value"] = _fmt_hex(sig_bit[1:], 80) if len(sig_bit) > 1 else ""
+            d["sig_value"] = sig_bit[1:].hex() if len(sig_bit) > 1 else ""
+        if ext_val:
+            _parse_cert_extensions(ext_val, d)
         d["note"] = "（cryptography 不支持该曲线，已用 ASN.1 松散解析）" if "SM2" in d.get("pubkey", "") else "（ASN.1 松散解析）"
+        d["der_hex"] = der.hex()
         return d
     except Exception as e:
         return {"error": "证书解析失败: %r" % e, "der_hex": _fmt_hex(der, 48)}
+
+
+_KEY_USAGE_BITS = (
+    (0, "digitalSignature 数字签名"), (1, "nonRepudiation 不可否认性"),
+    (2, "keyEncipherment 密钥加密"), (3, "dataEncipherment 数据加密"),
+    (4, "keyAgreement 密钥协商"), (5, "keyCertSign 证书签发"),
+    (6, "cRLSign CRL 签发"), (7, "encipherOnly"), (8, "decipherOnly"),
+)
+
+
+def _key_usage_text_raw(bitstr: bytes) -> str:
+    """KeyUsage ::= BIT STRING（首字节为未用位数，其余字节 MSB 优先）→ 用法文本。"""
+    if not bitstr:
+        return "（未声明）"
+    unused = bitstr[0]
+    total = len(bitstr[1:]) * 8 - min(unused, 7)
+    names = []
+    for i, b in enumerate(bitstr[1:]):
+        for j in range(8):
+            idx = i * 8 + j
+            if idx >= total:
+                break
+            if b & (0x80 >> j):
+                nm = dict(_KEY_USAGE_BITS).get(idx)
+                if nm:
+                    names.append(nm)
+    return ", ".join(names) or "（未声明）"
+
+
+def _parse_cert_extensions(exts_val: bytes, d: dict):
+    """[3] EXPLICIT Extensions（内容为 SEQUENCE OF Extension）；提取
+    keyUsage / basicConstraints / EKU。"""
+    try:
+        _, seqv, _ = _ber_tlv(exts_val, 0)  # Extensions ::= SEQUENCE OF Extension 的全部内容
+    except Exception:
+        return
+    o = 0
+    while o + 2 <= len(seqv):
+        try:
+            _, ev, off = _ber_tlv(seqv, o)  # 单个 Extension ::= SEQ{ extnID, critical?, extnValue }
+            _, oid_b, o2 = _ber_tlv(ev, 0)
+            ext_oid = _ber_oid_str(oid_b)
+            t2, v2, o2 = _ber_tlv(ev, o2)
+            if t2 == 0x01:  # 可选 critical(BOOLEAN)，其后才是 extnValue(OCTET STRING)
+                _, evb, _ = _ber_tlv(ev, o2)
+            else:
+                evb = v2
+            if ext_oid == "2.5.29.15":
+                _, kb, _ = _ber_tlv(evb, 0)
+                d["key_usage"] = _key_usage_text_raw(kb)
+            elif ext_oid == "2.5.29.19":
+                _, bcseq, _ = _ber_tlv(evb, 0)
+                ca = False
+                bo2 = 0
+                if bo2 < len(bcseq):
+                    t1, v1, bo2 = _ber_tlv(bcseq, bo2)
+                    if t1 == 0x01:
+                        ca = v1 != b"\x00"
+                d["basic_constraints"] = "is_ca=%s" % ca
+            elif ext_oid == "2.5.29.37":
+                names = []
+                bo2 = 0
+                while bo2 < len(evb):
+                    _, oidb, bo2 = _ber_tlv(evb, bo2)
+                    names.append(_EKU_NAME.get(_ber_oid_str(oidb), _ber_oid_str(oidb)))
+                if names:
+                    d["ext_key_usage"] = ", ".join(names)
+            o = off
+        except Exception:
+            break
 
 
 def _fmt_pubkey(pub):
@@ -651,7 +843,7 @@ def parse_certificate_verify(body: bytes):
     scheme = struct.unpack(">H", body[0:2])[0]
     sn = struct.unpack(">H", body[2:4])[0]
     d["signature_scheme"] = "%s (0x%04X)" % (_sig_name(scheme), scheme)
-    d["signature"] = _fmt_hex(body[4:4 + sn], 120)
+    d["signature"] = body[4:4 + sn].hex()
     d["signature_len"] = sn
     return d
 
@@ -689,8 +881,8 @@ def _sig_fields(d, sig):
     der = _parse_der_ecdsa(sig)
     if der:
         r, s = der
-        d["signature_r"] = _fmt_hex(r, 80)
-        d["signature_s"] = _fmt_hex(s, 80)
+        d["signature_r"] = r.hex()
+        d["signature_s"] = s.hex()
 
 
 def parse_server_key_exchange(body: bytes):
@@ -716,7 +908,7 @@ def parse_server_key_exchange(body: bytes):
             d["curve_type"] = "named_curve (命名椭圆曲线)"
             d["named_group"] = _group_name(grp)
             if off + plen <= len(body):
-                d["ec_pubkey"] = _fmt_hex(body[off:off + plen], 40)
+                d["ec_pubkey"] = body[off:off + plen].hex()
                 off += plen
         elif ptype == 1:
             d["curve_type"] = "explicit_prime (显式素数域曲线)"
@@ -729,7 +921,7 @@ def parse_server_key_exchange(body: bytes):
             sig = body[off:off + slen]
             d["signature_scheme"] = "%s (0x%04X)" % (_sig_name(scheme), scheme)
             d["signature_length"] = "%dB" % slen
-            d["signature"] = _fmt_hex(sig, 120)
+            d["signature"] = sig.hex()
             _sig_fields(d, sig)
         return d
     # TLCP / GB/T 38636 ECC-SM2-EXPORT：无内嵌参数，整个消息 = 2 字节长度 + DER SM2 签名
@@ -739,14 +931,14 @@ def parse_server_key_exchange(body: bytes):
         slen = struct.unpack(">H", body[0:2])[0]
         sig = body[2:2 + slen]
         d["signature_length"] = "%dB" % slen
-        d["signature"] = _fmt_hex(sig, 120)
+        d["signature"] = sig.hex()
         d["signature_algorithm"] = "SM2 签名 (DER 编码)" if sig and sig[0] == 0x30 else "（非 DER）"
         _sig_fields(d, sig)
     return d
 
 
 def parse_finished(body: bytes):
-    return {"verify_data": _fmt_hex(body, 64)}
+    return {"verify_data": body.hex()}
 
 
 # ---------------------------------------------------------------- TCP 流重组 + 全量解析
@@ -1074,15 +1266,15 @@ def parse_client_key_exchange(body: bytes) -> dict:
         pub = body[1:1 + klen]
         d["key_exchange_len"] = len(body)
         d["pubkey_len"] = klen
-        d["pubkey_hex"] = _fmt_hex(pub, 48)
+        d["pubkey_hex"] = pub.hex()
     elif len(body) >= 2:
         rlen = struct.unpack(">H", body[:2])[0]
         d["key_exchange_len"] = len(body)
         d["encrypted_premaster_len"] = rlen
-        d["encrypted_premaster_hex"] = _fmt_hex(body[2:2 + rlen], 48)
+        d["encrypted_premaster_hex"] = body[2:2 + rlen].hex()
     else:
         d["key_exchange_len"] = len(body)
-        d["key_exchange_hex"] = _fmt_hex(body, 48)
+        d["key_exchange_hex"] = body.hex()
     return d
 
 
@@ -1111,7 +1303,7 @@ def _fields_for(mt: int, body: bytes, proto: str = "TLS"):
         # NewSessionTicket: lifetime(4) age_add(4) nonce_len(1) nonce ticket_len(2) ticket
         if len(body) >= 10:
             tlen = struct.unpack(">H", body[8:10])[0]
-            return {"ticket_len": tlen, "ticket_hex": _fmt_hex(body[10:10 + tlen], 48)}
+            return {"ticket_len": tlen, "ticket_hex": body[10:10 + tlen].hex()}
         return {}
     return {}
 

@@ -86,22 +86,26 @@ def find_tcp_handshake(pkts, key, client_endpoint: str, max_events: int = 3):
     return evs
 
 
-def messages_to_events(messages):
+def messages_to_events(messages, cdir=None):
     """把流解析出的应用层消息列表转成时序图事件。
 
     messages 条目形如 {"dir": "A->B"|"B->A", "proto": …, "type": …, "summary": …}，
-    首个消息方向即 客户端→服务端 方向。事件附带完整 fields 供点击后展开关键参数。"""
+    首个消息方向默认即 客户端→服务端 方向（SSH 流可显式传 cdir 修正）。
+    事件附带完整 fields 供点击后展开关键参数；形如 `X_full`/`X_list` 的字段
+    用于多行完整展示，展示时隐藏对应的截断版基字段。"""
     if not messages:
         return []
-    cdir = next((m["dir"] for m in messages if m.get("type") == "ClientHello"),
-                messages[0]["dir"])
+    if cdir is None:
+        cdir = next((m["dir"] for m in messages if m.get("type") == "ClientHello"),
+                    messages[0]["dir"])
     evs = []
     for m in messages:
         d = "c->s" if m["dir"] == cdir else "s->c"
         fields = list((m.get("fields") or {}).items())
-        # 密码套件：保留全量列表字段，去掉截断版，供点击后完整展示
-        if any(k == "cipher_suites_full" for k, _ in fields):
-            fields = [(k, v) for k, v in fields if k != "cipher_suites"]
+        keys = [k for k, _ in fields]
+        drop = {k[:-5] for k in keys if k.endswith("_full")} | {k[:-5] for k in keys if k.endswith("_list")}
+        if drop:
+            fields = [(k, v) for k, v in fields if k not in drop]
         evs.append({
             "seq": 0,
             "dir": d,
@@ -113,6 +117,80 @@ def messages_to_events(messages):
             "fields": fields,
         })
     return evs
+
+
+def _ssh_summary_html(fd):
+    """把“SSH 协商算法”汇总字段渲染为参考工具风格的报告块。
+
+    fd 形如 {SSH 版本/会话状态/密钥交换方法 (kex)/…/客户端交换值/…/会话过滤器/精确帧过滤器/帧数量}。"""
+    from html import escape
+
+    def esc(v):
+        return escape(str(v))
+
+    def show(v):
+        return v if v not in (None, "", "-") else "-"
+
+    head = "<span style='color:#2563EB'><b>%s</b></span>" % esc(fd.get("SSH 版本") or "SSH")
+    st = fd.get("会话状态") or ""
+    if st:
+        color = {"完整": "#16a34a", "不完整": "#d97706"}.get(st, "#6b7280")
+        head += "　<span style='color:%s;font-weight:bold'>%s</span>" % (color, esc(st))
+
+    def kv(name, key):
+        return "%s：<span style='color:#2563EB'><b>%s</b></span>" % (name, esc(show(fd.get(key))))
+
+    rows = ["　".join([
+        kv("密钥交换", "密钥交换方法 (kex)"),
+        kv("加密算法", "加密算法 c→s"),
+        kv("完整性算法", "MAC 算法 c→s"),
+        kv("服务端签名", "主机密钥算法 (host key)"),
+    ])]
+
+    sup = []
+    for name, key in (("密钥协商算法", "服务端支持·密钥交换算法"),
+                      ("加密算法", "服务端支持·加密算法"),
+                      ("完整性算法", "服务端支持·完整性算法")):
+        v = fd.get(key)
+        if not v or v == "-":
+            sup.append("%s：-" % name)
+        else:
+            items = [x for x in str(v).split(" | ") if x.strip()]
+            sup.append("%s：%d 项（%s…）" % (name, len(items), items[0][:40]))
+    rows.append("<span style='color:#4b5563'>服务端支持：</span>" + "　".join(sup))
+
+    params = []
+    for name, key in (("客户端交换值", "客户端交换值"), ("服务端交换值", "服务端交换值")):
+        v = fd.get(key)
+        if v not in (None, "", "-"):
+            params.append("%s <span style='font-family:Consolas'>%s…</span>" % (name, esc(str(v))[:48]))
+    sa = fd.get("服务端签名算法")
+    if sa not in (None, "", "-"):
+        params.append("服务端签名算法 %s" % esc(str(sa)))
+    hk = fd.get("服务端主机密钥格式")
+    hkv = fd.get("服务端主机密钥")
+    if hk not in (None, "", "-") or hkv not in (None, "", "-"):
+        if hk not in (None, "", "-"):
+            params.append("服务端主机密钥（%s）<span style='font-family:Consolas'>%s…</span>"
+                          % (esc(str(hk)), esc(str(hkv or ""))[:48]))
+        else:
+            params.append("服务端主机密钥 <span style='font-family:Consolas'>%s…</span>" % esc(str(hkv))[:48])
+    rows.append("<span style='color:#4b5563'>密钥协商参数：</span>" +
+                ("　".join(params) if params else "（未捕获到 KEXDH 消息）"))
+
+    loc = fd.get("会话过滤器")
+    fr = fd.get("精确帧过滤器")
+    fc = fd.get("帧数量")
+    if loc or fr:
+        s = ""
+        if loc:
+            s += esc(str(loc))
+        if fr:
+            s += " · %s" % esc(str(fr))
+        if fc:
+            s += "（%s 帧）" % esc(str(fc))
+        rows.append("<span style='color:#78909C'>Wireshark 定位：%s</span>" % s)
+    return head + "<br>" + "<br>".join(rows)
 
 
 def _summary_inner(client, server, events, proto=""):
@@ -140,50 +218,87 @@ def _summary_inner(client, server, events, proto=""):
 
     ver = (f_client or {}).get("legacy_version") or (f_server or {}).get("legacy_version") or ""
     suite = (f_server or {}).get("selected_cipher_suite") or ""
-    ps = ("协商版本：%s　·　<b>最终选定密码套件："
-           "<span style='color:#2563EB'>%s</span></b>"
-           % (esc(ver or "—"), esc(suite or "—")))
-    # SSH：无 TLS 风格的 ClientHello/ServerHello，改展示 KEXINIT 双端协商选定的算法
+    version_html = "<span style='color:#2563EB'><b>%s</b></span>" % esc(ver or "—")
+    suite_html = "<span style='color:#2563EB'><b>%s</b></span>" % esc(suite or "—")
+    ps = ("协商版本：%s　·　<b>最终选定密码套件：%s</b>" % (version_html, suite_html))
+    # SSH：无 TLS 风格的 ClientHello/ServerHello，改展示参考工具风格的 SSH 协商报告
     if not f_client and not f_server:
         for e in events or []:
             if e.get("title") == "SSH 协商算法":
-                rules = [esc(v) for k, v in (e.get("fields") or []) if k == "协商规则"]
-                rows = ["%s：<span style='color:#2563EB'><b>%s</b></span>"
-                        % (esc(k), esc(v))
-                        for k, v in (e.get("fields") or []) if k != "协商规则"]
-                if rows:
-                    ps = "<b>双端协商选定的 SSH 算法</b>（%s）：<br>%s" % (
-                        rules[0] if rules else "RFC 4253", "<br>".join(rows))
-                else:
-                    ps = "<span style='color:#9ca3af'>未解析出 SSH 算法协商结果（缺少任一方 KEXINIT）</span>"
+                fd = {k: v for k, v in (e.get("fields") or [])}
+                ps = _ssh_summary_html(fd)
                 break
         else:
             ps = ("<span style='color:#9ca3af'>SSH 握手解析：详见下方时序卡片"
                   "（版本交换 / KEXINIT / KEXDH_INIT / KEXDH_REPLY / NEWKEYS）</span>")
         return ps
+    # 服务端密钥交换（ECC-SM2-EXPORT / ECDHE 参数与签名）并入协商参数
+    ske = None
+    cv_verify = None
+    for e in events or []:
+        d = {k: v for k, v in (e.get("fields") or [])}
+        t = e.get("title") or ""
+        if not t:
+            continue
+        if t == "ServerKeyExchange" and e.get("dir") == "s->c" and ske is None:
+            ske = d
+        elif t == "CertificateVerify" and e.get("dir") == "c->s" and cv_verify is None:
+            cv_verify = d
+
     if f_cert:
-        if chain_n:
-            ps += "<br>服务端证书·共 %d 张：<br>" % chain_n
-        else:
-            ps += "<br>服务端证书：<br>"
         rows = []
+        rows.append(("<b>服务端证书</b>·共 %d 张" % chain_n) if chain_n else "<b>服务端证书</b>")
+        add = []
         if f_cert.get("cert1_subject"):
-            rows.append("主体：%s" % esc(f_cert["cert1_subject"]))
+            add.append("主体 %s" % esc(f_cert["cert1_subject"]))
+        if f_cert.get("cert1_issuer"):
+            add.append("签发者 %s" % esc(f_cert["cert1_issuer"]))
         if f_cert.get("cert1_pubkey"):
-            rows.append("公钥算法：%s" % esc(f_cert["cert1_pubkey"]))
+            add.append("公钥算法 %s" % esc(f_cert["cert1_pubkey"]))
+        if f_cert.get("cert1_pubkey_curve"):
+            add.append("公钥曲线 %s" % esc(f_cert["cert1_pubkey_curve"]))
         if f_cert.get("cert1_sig_algorithm"):
-            rows.append("签名算法：%s" % esc(f_cert["cert1_sig_algorithm"]))
+            add.append("签名算法 %s" % esc(f_cert["cert1_sig_algorithm"]))
         sig = esc(f_cert.get("cert1_sig_value") or "")
         if sig:
-            rows.append("签名值：<span style='font-family:Consolas'>%s…</span>" % sig[:28])
+            add.append("签名值 <span style='font-family:Consolas'>%s</span>" % sig)
         thumb = esc(f_cert.get("cert1_sha256_thumb") or "")
         if thumb:
-            rows.append("指纹(SHA256)：%s…" % thumb[:14])
-        ps += "　".join(("· " + r) for r in rows) if rows else "（未能解析证书内容）"
+            add.append("指纹(SHA256) %s" % thumb)
+        rows.append("<br>".join("· " + a for a in add))
         if chain_n and chain_n > 1:
-            ps += "<br><span style='color:#9ca3af'>… 其余 %d 张证书：点击时序图卡片中的「证书 N」按钮逐一查看</span>" % (chain_n - 1)
+            rows.append("<span style='color:#9ca3af'>… 其余 %d 张证书：点击时序图卡片中的「证书 N」按钮逐一查看</span>" % (chain_n - 1))
+        ps += "<br>" + "<br>".join(rows)
     else:
         ps += "<br><span style='color:#9ca3af'>未捕获到服务端证书（TLS 1.3 加密握手或缺失流量）</span>"
+
+    if ske:
+        parts = []
+        if ske.get("curve_type"):
+            parts.append("曲线 %s" % esc(ske["curve_type"]))
+        if ske.get("named_group"):
+            parts.append("组 %s" % esc(ske["named_group"]))
+        if ske.get("signature_algorithm"):
+            parts.append("算法 %s" % esc(ske["signature_algorithm"]))
+        if ske.get("signature_scheme"):
+            parts.append("签名方案 %s" % esc(ske["signature_scheme"]))
+        sksig = esc(ske.get("signature") or "")
+        if sksig:
+            parts.append("签名值 <span style='font-family:Consolas'>%s</span>" % sksig)
+        ps += "<br><span style='color:#4b5563'>服务端密钥交换（ServerKeyExchange）：</span>" + \
+              ("　".join("· " + p for p in parts) if parts else "（未能解析）")
+
+    if cv_verify:
+        cvp = []
+        sch = esc(cv_verify.get("signature_scheme") or "")
+        if sch:
+            cvp.append("签名方案 %s" % sch)
+        cvs = esc(cv_verify.get("signature") or "")
+        if cvs:
+            cvp.append("签名值 <span style='font-family:Consolas'>%s</span>" % cvs)
+        if cvp:
+            ps += "<br><span style='color:#B45309'>客户端 CertificateVerify（身份鉴别）：</span>" + \
+                  ("　".join("· " + p for p in cvp))
     return ps
 
 
@@ -227,9 +342,18 @@ def _client_auth_inner(events):
         if n:
             rows.append("客户端证书链：%d 张" % n)
         if certd.get("cert1_subject"):
-            rows.append("<b>主体：%s</b>" % esc(certd["cert1_subject"]))
+            rows.append("主体：%s" % esc(certd["cert1_subject"]))
+        if certd.get("cert1_issuer"):
+            rows.append("签发者：%s" % esc(certd["cert1_issuer"]))
+        if certd.get("cert1_pubkey"):
+            rows.append("公钥算法：%s" % esc(certd["cert1_pubkey"]))
+        if certd.get("cert1_pubkey_curve"):
+            rows.append("公钥曲线：%s" % esc(certd["cert1_pubkey_curve"]))
         if certd.get("cert1_sig_algorithm"):
             rows.append("签名算法：%s" % esc(certd["cert1_sig_algorithm"]))
+        csig = esc(certd.get("cert1_sig_value") or "")
+        if csig:
+            rows.append("签名值：<span style='font-family:Consolas'>%s</span>" % csig)
         if certd.get("cert1_ext_key_usage"):
             rows.append("证书用途(EKU)：%s" % esc(certd["cert1_ext_key_usage"]))
         if certd.get("cert1_key_usage"):
@@ -247,7 +371,7 @@ def _client_auth_inner(events):
         if sch:
             ps += "· CertificateVerify 签名方案：%s" % esc(sch)
         if sig:
-            ps += "<br>· 客户端签名值：<span style='font-family:Consolas'>%s…</span>" % esc(sig[:32])
+            ps += "<br>· 客户端签名值：<span style='font-family:Consolas'>%s</span>" % esc(sig)
         if not sch and not sig:
             ps += "· CertificateVerify（签名值与方案见时序图卡片）"
     if certd is None and verify is None:
@@ -278,14 +402,16 @@ def event_detail_text(ev) -> str:
     if fields:
         lines.append("关键参数：")
         for k, v in fields:
+            if k == "der_hex":
+                continue
             s = str(v)
             if " | " in s:
                 parts = [x for x in s.split(" | ") if x.strip()]
-                k_disp = "cipher_suites" if k == "cipher_suites_full" else k
+                k_disp = k[:-5] if k.endswith("_full") or k.endswith("_list") else k
                 lines.append("  %s（%d 项）：" % (k_disp, len(parts)))
                 lines.append(_wrap_field(s))
             else:
-                lines.append("  %s：%s" % (k, s if len(s) <= 160 else s[:160] + "…"))
+                lines.append("  %s：%s" % (k, s))
     else:
         lines.append("摘要：%s" % ev.get("detail", ""))
     return "\n".join(lines)
@@ -377,7 +503,7 @@ def first_completed_key(flows):
     """
     best = None
     for key, fl in (flows or {}).items():
-        evs = negotiation_events(messages_to_events(fl.get("messages") or []))
+        evs = negotiation_events(messages_to_events(fl.get("messages") or [], fl.get("cdir")))
         if not _flow_completed(evs):
             continue
         fin = max((e.get("no") for e in evs if e.get("no") is not None), default=None)
@@ -412,9 +538,34 @@ def flow_combo_items(flows, only_first: bool = False):
 
 # ------------------------------------------------------------ 协商集（TLS 首次 / TLCP 双向）
 
-def _phase_events(fl):
-    """取一个流的协商关键事件（已完成过滤与阶段排序）。"""
-    return negotiation_events(messages_to_events(fl.get("messages") or []))
+def _build_raw_events(fl):
+    """流的原始应用层事件（未过滤，供双向鉴别等判定使用）。"""
+    return messages_to_events(fl.get("messages") or [], fl.get("cdir"))
+
+
+def _phase_events(fl, split="all"):
+    """取一个流的协商关键事件（已完成过滤与阶段排序）。
+
+    split="phase1" 时只取到客户端出示证书之前（服务端鉴别段）；
+    split="phase2" 时只取客户端出示证书起（客户端鉴别段）；否则取全部。
+    """
+    evs = negotiation_events(_build_raw_events(fl))
+    if split == "phase1":
+        end = _client_cert_start(evs)
+        return evs if end is None else evs[:end]
+    if split == "phase2":
+        start = _client_cert_start(evs)
+        return [] if start is None else evs[start:]
+    return evs
+
+
+def _client_cert_start(evs):
+    """客户端出示自身证书的事件下标（第一个 c->s 的 Certificate / CertificateVerify），无则 None。"""
+    for i, e in enumerate(evs):
+        t = e.get("title")
+        if e.get("dir") == "c->s" and t in ("Certificate", "CertificateVerify"):
+            return i
+    return None
 
 
 def _fin_no(evs):
@@ -432,9 +583,12 @@ def _srv_ip(fl):
     return s
 
 
-def _has_client_auth(evs):
+def _has_client_auth(fl, evs=None):
     """会话是否真正实现了（反向）客户端身份鉴别：
-    服务端请求客户端证书（CertificateRequest），或客户端在 c->s 方向出示自身证书 / 证书验证。"""
+    服务端请求客户端证书（CertificateRequest），或客户端在 c->s 方向出示自身证书 / 证书验证。
+    evs 缺省时用未过滤的原始事件判定（避免 CertificateRequest 等空载荷消息被展示过滤丢弃）。"""
+    if evs is None:
+        evs = _build_raw_events(fl)
     for e in evs:
         t = e.get("title")
         d = e.get("dir")
@@ -490,16 +644,31 @@ def negotiation_sets(flows):
     for srv in order:
         items = peers[srv]
         key0, fl0, evs0, fin0 = items[0]
-        ca = next((it for it in items if _has_client_auth(it[2])), None)
-        phases = [{"label": PHASE1_LABEL, "key": key0,
-                   "client": fl0.get("client"), "server": fl0.get("server")}]
-        used.add(key0)
-        bidir = ca is not None and ca[0] != key0
-        if bidir:
+        ca = next((it for it in items if _has_client_auth(it[1])), None)
+        bidir = ca is not None
+        if bidir and ca[0] != key0:
+            # 双向鉴别发生在两条独立流（对端反向连接）：①服务端鉴别 ②反向客户端鉴别
             ck, cfl, cevs, cfin = ca
-            phases.append({"label": PHASE2_LABEL, "key": ck,
-                           "client": cfl.get("client"), "server": cfl.get("server")})
+            phases = [{"label": PHASE1_LABEL, "key": key0,
+                       "split": "all",
+                       "client": fl0.get("client"), "server": fl0.get("server")},
+                      {"label": PHASE2_LABEL, "key": ck,
+                       "split": "all",
+                       "client": cfl.get("client"), "server": cfl.get("server")}]
             used.add(ck)
+        elif bidir:
+            # 双向鉴别发生在同一条流内：①服务端鉴别（客户端出示证书前）②客户端鉴别（出示证书起）
+            phases = [{"label": PHASE1_LABEL, "key": key0,
+                       "split": "phase1",
+                       "client": fl0.get("client"), "server": fl0.get("server")},
+                      {"label": PHASE2_LABEL, "key": key0,
+                       "split": "phase2",
+                       "client": fl0.get("client"), "server": fl0.get("server")}]
+        else:
+            phases = [{"label": PHASE1_LABEL, "key": key0,
+                       "split": "all",
+                       "client": fl0.get("client"), "server": fl0.get("server")}]
+        used.add(key0)
         sets_.append({
             "label": "%s ⇄ %s · TLCP %s" % (
                 fl0.get("client"), fl0.get("server"),
@@ -558,7 +727,7 @@ def set_to_events(flows, aset, max_events: int = 120):
             # 单段协商不插横幅（保持原有卡片索引不变）；双向鉴别才用横幅区分两段
             evs.append({"kind": "phase", "dir": "center", "title": ph.get("label", "协商"),
                         "detail": sub, "no": None, "ts": None, "fields": []})
-        evs.extend(_phase_events(fl))
+        evs.extend(_phase_events(fl, ph.get("split", "all")))
     if len(evs) > max_events:
         evs = evs[:max_events]
         evs.append({"kind": "…", "dir": "c->s", "title": "…",
@@ -579,7 +748,7 @@ def negotiation_set_html(flows, aset, proto=""):
         evs = _phase_events(fl)
         inner = _summary_inner(ph.get("client") or "", ph.get("server") or "", evs,
                                aset.get("proto", fl.get("proto", proto)))
-        if _has_client_auth(evs):
+        if _has_client_auth(fl, evs):
             inner = _client_auth_inner(evs) + "<br>----<br>" + inner
         badge = "第 %d 段" % (i + 1)
         boxes.append(

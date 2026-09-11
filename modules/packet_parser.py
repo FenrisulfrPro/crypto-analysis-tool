@@ -753,6 +753,23 @@ def analyze_streams(pkts) -> dict:
                               "stream": stream_idx.get(key),
                               "frames": stream_frames.get(key),
                               "messages": msgs}
+        # CSSH（GM/T 0129-2023 国密 SSH）：按版本串识别，走 cssh_parser 专用解析
+        if key not in flows and (ab.startswith(b"CSSH-1.0") or ba.startswith(b"CSSH-1.0")):
+            from . import cssh_parser as _cssh
+            msgs, cdir_txt, cver, sver = _cssh.flow_from_reassembly(
+                ab, ba, f.get("ab_base", 0), f.get("ba_base", 0),
+                _ssh_segs(f, "ab"), _ssh_segs(f, "ba"), f.get("init", ""))
+            if msgs:
+                a, ap, b, bp = key
+                client, server = ("%s:%d" % (a, ap), "%s:%d" % (b, bp))
+                if cdir_txt == "B->A":
+                    client, server = server, client
+                flows[key] = {"client": client, "server": server,
+                              "proto": "CSSH", "cdir": cdir_txt,
+                              "client_version": cver, "server_version": sver,
+                              "stream": stream_idx.get(key),
+                              "frames": stream_frames.get(key),
+                              "messages": msgs}
     return flows
 
 

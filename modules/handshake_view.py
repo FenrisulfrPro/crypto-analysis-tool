@@ -193,6 +193,89 @@ def _ssh_summary_html(fd):
     return head + "<br>" + "<br>".join(rows)
 
 
+def _cssh_summary_inner(client, server, events):
+    """CSSH 协商总结：协商算法（只高亮国密项）、Cookie、双证书、SM2 验签（含签名值）。
+
+    事件为 set_to_events 后的 CSSH 时序事件（fields 为 [(k, v)]）。"""
+    from html import escape
+    try:
+        from . import cssh_parser as _cssh
+    except Exception:
+        return "<span style='color:#9ca3af'>CSSH 解析模块不可用</span>"
+    esc = escape
+    rows = []
+    f = {}
+    for e in events or []:
+        t = e.get("title") or ""
+        if t:
+            f.setdefault(t, []).append(dict(e.get("fields") or []))
+
+    ver = []
+    for fd in f.get("版本交换", []):
+        if fd.get("版本串"):
+            ver.append(esc(fd["版本串"]))
+    if ver:
+        rows.append("版本：%s" % "　·　".join(ver))
+
+    kx = f.get("KEXINIT", [])
+    if kx:
+        row = []
+        for key, lab in (("密钥交换算法", "KEX"), ("加密算法(客户端→服务端)", "加密"),
+                         ("MAC 算法(客户端→服务端)", "MAC")):
+            fd = next((d for d in kx if d.get(key)), None)
+            if fd and fd.get(key) and str(fd[key]).strip() and str(fd[key]) != "(空)":
+                row.append("%s %s" % (lab, _cssh.highlight_algs(fd[key])))
+        if row:
+            rows.append("<b>协商算法</b>（只高亮国密算法）：<br>" + "<br>".join("&nbsp;&nbsp;" + r for r in row))
+    ck = next((d.get("Cookie 随机数") for d in kx if d.get("Cookie 随机数")), None)
+    if ck:
+        rows.append("Cookie(C)=%s" % esc(ck))
+
+    req = next(iter(f.get("KEX_REQUEST", [])), {})
+    rep = next(iter(f.get("KEX_REPLY", [])), {})
+    rc = req.get("random-client") or ""
+    rs = rep.get("random-server") or ""
+    sig = rep.get("签名值 (DER)") or ""
+    if rc or rs or sig:
+        ok = rep.get("验签结果")
+        if ok == "通过":
+            badge = "<span style='background:#DCFCE7;color:#15803D;border-radius:4px;padding:1px 6px;font-weight:bold'>验签通过 ✓</span>"
+        elif ok == "失败":
+            badge = "<span style='background:#FEE2E2;color:#B91C1C;border-radius:4px;padding:1px 6px;font-weight:bold'>验签失败 ✗</span>"
+        else:
+            badge = "<span style='background:#FEF3C7;color:#92400E;border-radius:4px;padding:1px 6px;font-weight:bold'>未能验签 ⚠</span>"
+        rows.append("<b>服务端身份鉴别（SM2 验签，用户标识 1234567812345678）</b>%s<br>"
+                    "&nbsp;&nbsp;random-client = <code>%s</code><br>"
+                    "&nbsp;&nbsp;random-server = <code>%s</code><br>"
+                    "&nbsp;&nbsp;待签名数据 M = rc ∥ rs（16 字节）" % (badge, esc(rc), esc(rs)))
+        if sig:
+            rows.append("&nbsp;&nbsp;签名值 (DER) = <code>%s</code>" % esc(sig))
+        pu = rep.get("签名公钥") or ""
+        if pu:
+            rows.append("&nbsp;&nbsp;签名公钥（签名证书 SPKI）：<code>%s…</code>" % esc(pu[:48]))
+        rows.append("&nbsp;&nbsp;验签结果：%s" % esc(rep.get("验签详情") or ""))
+
+    certs = []
+    flds = next(iter(f.get("KEX_REPLY", [])), {})
+    if flds.get("cert_chain_count"):
+        for i in (1, 2):
+            sub = flds.get("cert%d_subject" % i)
+            if sub is not None:
+                certs.append((i, sub, flds.get("cert%d_key_usage" % i, "")))
+    for i, sub, ku in certs:
+        rows.append("服务端证书%d：主体 %s（密钥用途 %s）" % (i, esc(str(sub)), esc(str(ku))))
+    if len(certs) == 2 and str(certs[0][1]) == str(certs[1][1]):
+        rows.append("<span style='color:#15803D'>双证书主体一致 ✓</span>")
+    if certs and "数字签名" not in str(certs[0][2]):
+        rows.append("<span style='color:#B45309'>注：签名证书 keyUsage 未声明「数字签名」（GB/T 38540 加密证书格式如实解析，实际仍承担签名）</span>")
+
+    kxfd = next((d for d in f.get("KEX", []) if d.get("enc(K)（SM2 加密主密钥）")), None)
+    if kxfd:
+        ek = kxfd["enc(K)（SM2 加密主密钥）"]
+        rows.append("enc(K)（SM2 加密主密钥）：<code>%s…</code>（%d 字节）" % (esc(str(ek)[:64]), len(str(ek)) // 2))
+    return "<br>".join(rows)
+
+
 def _summary_inner(client, server, events, proto=""):
     """生成单段协商总结的正文（协商版本/套件/服务端证书），不含外层容器与标题行。"""
     from html import escape
@@ -221,6 +304,9 @@ def _summary_inner(client, server, events, proto=""):
     version_html = "<span style='color:#2563EB'><b>%s</b></span>" % esc(ver or "—")
     suite_html = "<span style='color:#2563EB'><b>%s</b></span>" % esc(suite or "—")
     ps = ("协商版本：%s　·　<b>最终选定密码套件：%s</b>" % (version_html, suite_html))
+    # CSSH：国密 SSH 专属总结（算法高亮 + 双证书 + SM2 验签含签名值）
+    if proto == "CSSH":
+        return _cssh_summary_inner(client, server, events)
     # SSH：无 TLS 风格的 ClientHello/ServerHello，改展示参考工具风格的 SSH 协商报告
     if not f_client and not f_server:
         for e in events or []:
@@ -428,17 +514,27 @@ def _negotiation_stage(title, side):
     """
     if title == "ClientHello":
         return 0
+    if title in ("版本交换", "KEXINIT"):       # CSSH
+        return 0
     if title in ("ServerHello", "EncryptedExtensions", "Certificate", "ServerKeyExchange",
                  "CertificateRequest", "NewSessionTicket"):
         if title == "Certificate" and side == "client":
             return 3
         return 1
+    if title == "KEX_REQUEST":                 # CSSH
+        return 1
     if title == "ServerHelloDone":
+        return 2
+    if title == "KEX_REPLY":                   # CSSH
         return 2
     if title in ("ClientCertificate", "ClientKeyExchange", "CertificateVerify"):
         return 3
+    if title == "KEX":                         # CSSH（enc(K) 加密主密钥）
+        return 3
     if title == "ChangeCipherSpec":
         return 4 if side == "client" else 6
+    if title == "NEWKEYS":                     # CSSH
+        return 4
     if title == "Finished":
         return 5 if side == "client" else 7
     return 9
@@ -490,6 +586,11 @@ def _flow_completed(evs):
     """
     if any(e.get("title") == "Finished" for e in evs):
         return True
+    # CSSH：双方均发送 NEWKEYS 视为完成密钥协商（NewKeys 后进入 SM4 会话加密）
+    if any(e.get("kind") == "CSSH" for e in evs):
+        has_c = any(e.get("dir") == "c->s" and e.get("title") == "NEWKEYS" for e in evs)
+        has_s = any(e.get("dir") == "s->c" and e.get("title") == "NEWKEYS" for e in evs)
+        return has_c and has_s
     has_c = any(e.get("dir") == "c->s" and e.get("title") == "ChangeCipherSpec" for e in evs)
     has_s = any(e.get("dir") == "s->c" and e.get("title") == "ChangeCipherSpec" for e in evs)
     return has_c and has_s

@@ -1037,6 +1037,8 @@ class HandshakeView(QWidget):
             return "\n".join(divs)
         if e.get("title") == "Certificate":
             return self._cert_html(fields)
+        if e.get("title") == "KEX_REPLY":
+            return self._kex_reply_html(fields)
         total = len(fields)
         shown = 0
         for k, v in fields:
@@ -1111,6 +1113,53 @@ class HandshakeView(QWidget):
                         % ((n or 1) - 1))
         return "\n".join(divs)
 
+    def _kex_reply_html(self, fields):
+        """CSSH KEX_REPLY 卡首页：双证书（签名∥加密）+ random-server + SM2 签名值 + 验签。"""
+        f = {}
+        for k, v in fields:
+            f[k] = v
+        divs = [self.__class__._cert_html_inner(f, 1, 2)]
+        if f.get("random-server"):
+            divs.append("<div><span style='color:#374151'>random-server：</span>"
+                        "<span style='font-family:Consolas'>%s</span></div>"
+                        % _html.escape(self._clip(str(f["random-server"]), 24)))
+        if f.get("签名值 (DER)"):
+            divs.append("<div><span style='color:#374151'>签名值 (DER，GB/T 35276)：</span>"
+                        "<span style='font-family:Consolas'>%s…</span></div>"
+                        % _html.escape(self._clip(str(f["签名值 (DER)"]), 30)))
+        if f.get("验签结果"):
+            ok = f["验签结果"]
+            if ok == "通过":
+                badge = "<span style='background:#DCFCE7;color:#15803D;border-radius:3px;padding:0 5px;font-weight:bold'>验签通过 ✓</span>"
+            elif ok == "失败":
+                badge = "<span style='background:#FEE2E2;color:#B91C1C;border-radius:3px;padding:0 5px;font-weight:bold'>验签失败 ✗</span>"
+            else:
+                badge = "<span style='background:#FEF3C7;color:#92400E;border-radius:3px;padding:0 5px;font-weight:bold'>未能验签 ⚠</span>"
+            divs.append("<div><span style='color:#374151'>SM2 验签（M=rc∥rs）：</span>%s</div>" % badge)
+        return "\n".join(divs)
+
+    @staticmethod
+    def _cert_html_inner(f, n_first=1, n_total=1):
+        """证书区行渲染（供 Certificate / KEX_REPLY 卡复用）。"""
+        html_out = HandshakeView._cert_html_shared(f, n_first, n_total)
+        return html_out
+
+    @staticmethod
+    def _cert_html_shared(f, n_first, n_total):
+        divs = []
+        divs.append("<div style='color:#374151'><b>证书链</b>：%d 张（点击下方「证书 N」按钮查看每张详情）</div>" % n_total)
+        for i in range(1, n_first + 1):
+            pre = ("<b>第 %d 张</b>·" % i) if n_total > 1 else "<b>证书</b>·"
+            ku = f.get("cert%d_key_usage" % i)
+            if ku:
+                divs.append("<div>%s密钥用途：%s</div>" % (pre, _html.escape(HandshakeView._clip(str(ku), 40))))
+            if ku and i == 1 and "数字签名" not in str(ku):
+                divs.append("<div style='color:#B45309'>　↳ 签名证书 keyUsage 未声明数字签名（GB/T 38540 加密证书格式如实解析，实际仍承担 SM2 签名）</div>")
+            sub = f.get("cert%d_subject" % i)
+            if sub:
+                divs.append("<div>%s主体：%s</div>" % (pre, _html.escape(HandshakeView._clip(str(sub), 60))))
+        return "\n".join(divs)
+
     def _card_meta(self, e, side, cw):
         fm_n = QFontMetrics(QFont("Microsoft YaHei UI", 7.5))
         note = self._note_text(e)
@@ -1125,7 +1174,7 @@ class HandshakeView(QWidget):
         meta = {"title": title, "note": note, "doc": doc, "side": side,
                 "title_h": title_h, "note_h": note_h, "box_h": box_h,
                 "certs": 0, "btn_h": 0, "btn_rects": [], "rect": QRect()}
-        if title == "Certificate":
+        if title in ("Certificate", "KEX_REPLY"):
             f = dict((k, v) for k, v in (e.get("fields") or []))
             n = f.get("cert_chain_count") or 0
             for idx in range(1, 64):
@@ -1550,7 +1599,7 @@ class CertDetailDialog(QDialog):
 
 class PcapTab(QWidget):
     """协议分析 (pcap)：表格总览 + 点击行查看单包协议字段树，
-    并可一键查看该 TCP 流的完整消息交互（支持 TLS / TLCP / SSH）。"""
+    并可一键查看该 TCP 流的完整消息交互（支持 TLS / TLCP / SSH / CSSH）。"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pkts = []
@@ -1856,7 +1905,7 @@ class PcapTab(QWidget):
 
     # ------------------------------------------------------------ 时序图模式（模式 ②）
     def _ensure_streams(self):
-        """惰性计算全文件 TCP 流解析结果并缓存（含 TLS / TLCP / SSH 握手消息）。"""
+        """惰性计算全文件 TCP 流解析结果并缓存（含 TLS / TLCP / SSH / CSSH 握手消息）。"""
         if self._streams is None and self._pkts:
             try:
                 self._streams = packet_parser.analyze_streams(self._pkts)
@@ -1899,7 +1948,7 @@ class PcapTab(QWidget):
             self.hs_hint.setText("② 仅展示 ClientHello → Server Finished 关键协商包；点消息框或「关键参数」按钮查看详情")
         if len(sets_) == 0:
             self.handshake_view.set_sequence("", "", [{"seq": 1, "dir": "c->s", "kind": "…",
-                "title": "未识别到握手消息会话", "detail": "本pcap未解析出 TLS / TLCP / SSH 会话",
+                "title": "未识别到握手消息会话", "detail": "本pcap未解析出 TLS / TLCP / SSH / CSSH 会话",
                 "no": None, "ts": None}])
             return
         idx = sel if sel >= 0 else (self.flow_combo.currentIndex() if self.flow_combo.count() else 0)

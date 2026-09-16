@@ -8,7 +8,7 @@
 |------|------|
 | ① 国密 SM2 / SM3 | SM2密钥对生成、SM3 摘要、SM2 签名（SM3withSM2）、验签、公钥加密 / 私钥解密（C1C3C2），多格式消息与文件导入 |
 | ② 常用编码转换 | Base64 / Base64URL / HEX（大小写）/ UTF-8 / URL 编解码，多格式一键互转 |
-| ③ 协议分析 (pcap) | 解析 pcap / pcapng：密钥协商过程时序视图 + Wireshark 式报文列表，支持 TLS / TLCP / SSH / HTTP / DNS 等 |
+| ③ 协议分析 (pcap) | 解析 pcap / pcapng：密钥协商过程时序视图 + Wireshark 式报文列表，支持 TLS / TLCP / SSH / CSSH（国密 SSH）/ HTTP / DNS 等 |
 | ④ 证书分析 | 解析 PEM / DER 证书：版本、序列号、签名算法、签发者、有效期、公钥、指纹、自签名判断，兼容国密 SM2 证书 |
 | ⑤ 对称加解密 | SM4 / AES（128/192/256），ECB / CBC / CFB / OFB / CTR / GCM，PKCS7 填充，随机密钥/IV 生成 |
 | ⑥ 摘要 / HMAC | SM3 / MD5 / SHA-1 / SHA-224/256/384/512 一键全算，HMAC 消息认证码，支持文本 / 文件 |
@@ -25,9 +25,14 @@
 ### ③ 协议分析
 - 支持点击「选择 pcap / pcapng 文件」或直接把文件拖到本页加载（基于 scapy 解析）。
 - 两种视图模式：
-  - **① 密钥协商过程（客户端 ⇄ 服务端）**：以时序卡片展示 TLS / TLCP / SSH 握手交互。TLS/TLCP 显示 ClientHello → ServerHello → 证书链 → 密钥交换 → Finished 全过程及加密套件、SNI/ALPN、证书链（含国密 SM2 证书）；支持 TLCP **双向身份鉴别**、SSH 展示 KEXINIT 协商的**双端选定算法**（密钥交换/加密/MAC/压缩/主机密钥）。
+  - **① 密钥协商过程（客户端 ⇄ 服务端）**：以时序卡片展示 TLS / TLCP / SSH / CSSH 握手交互。TLS/TLCP 显示 ClientHello → ServerHello → 证书链 → 密钥交换 → Finished 全过程及加密套件、SNI/ALPN、证书链（含国密 SM2 证书）；支持 TLCP **双向身份鉴别**、SSH 展示 KEXINIT 协商的**双端选定算法**（密钥交换/加密/MAC/压缩/主机密钥）；CSSH（国密 SSH）展示完整国密协商过程与 SM2 验签结论（见下）。
   - **② 报文列表（Wireshark 式）**：逐包明细表，点击任意行弹出完整协议字段树（Ethernet / IP / TCP / UDP / ICMP / ARP / DNS / HTTP / SSH / TLS / TLCP），SSH 包自动标注客户端/服务端角色，可查看 TCP 流原文（Hex + ASCII）。
 - 支持协议下拉过滤 + 关键字条件搜索、导出 CSV。
+- **CSSH 国密 SSH 专项解析（GM/T 0129-2023）**：Wireshark 等工具无法识别 CSSH（只能看到 TCP），本工具直接深入 TCP 负载字节流检索并重组 CSSH 会话，在「① 密钥协商过程」视图中绘制完整国密握手时序：
+  - **协商时序**：版本交换 → KEXINIT（Cookie + 算法列表）→ KEX_REQUEST（random-client）→ KEX_REPLY（服务端双证书 + random-server + SM2 签名）→ KEX（enc(K) 加密主密钥）→ NEWKEYS，每张卡片标注真实抓包包号；
+  - **双证书解析**：从 KEX_REPLY 按「签名证书 ∥ 加密证书」提取服务端国密双证书（GM/T 0015 / GB/T 35276），卡片内可查看每张证书详情并一键导出 `.cer`；
+  - **SM2 验签（密钥协商有效性验证）**：用签名证书公钥对 M = random-client ∥ random-server 做 SM2 验签（GB/T 35276 DER 签名，用户标识 1234567812345678），协商总结与 KEX_REPLY 卡展示签名值、待签名数据、公钥与验签结论；
+  - 协商总结中**只对国密算法高亮显示**（SM2-SM3、curvesm2、SM4、CBC-MAC、HMAC-SM3 等），非国密算法保持普通文本。
 
 ### ④ 证书分析
 - 打开或拖拽 PEM / DER 证书文件（或在输入框粘贴 PEM 文本），点击「解析」。
@@ -51,7 +56,7 @@
 2. **输入**：多数模块支持直接在输入区粘贴文本（HEX / UTF-8 / Base64），也可点击「选择文件 / 拖拽导入…」按钮或直接把文件拖入窗口。
 3. **计算 / 解析**：点击各页的转换 / 签名 / 验签 / 加密 / 解密 / 解析 / 计算摘要等操作按钮。
 4. **结果**：逐字节审查可看输入区下方的「字节数 / 前若干字节」提示；表格结果支持右键复制。
-5. 协议分析流程：打开 pcap → 选择视图模式 → ① 模式点「协商过程总结 / 关键参数」查看握手时序与协商算法，② 模式点击报文行查看字段树，可用顶部过滤下拉框与搜索框缩小范围。
+5. 协议分析流程：打开 pcap → 选择视图模式 → ① 模式点「协商过程总结 / 关键参数」查看握手时序与协商算法（CSSH 国密 SSH 抓包会自动识别并展示国密协商过程、双证书与 SM2 验签结论），② 模式点击报文行查看字段树，可用顶部过滤下拉框与搜索框缩小范围。
 6. 任意时刻可用各页「清空」按钮复位（协议分析页同时清空统计、表格与物联时序图）。
 
 ## 三、不同系统的运行方式
@@ -111,13 +116,15 @@ CryptoAnalysisTool/
     ├── pcap_analysis.py     # pcap 协议分析（包统计/分布/明细、协议过滤搜索、SSH 报文列表反标）
     ├── cert_analysis.py     # X.509 证书分析核心逻辑（兼容国密 SM2 曲线 1.2.156.10197.1.301）
     ├── tls_parser.py        # TLS / TLCP 明文握手深度解析（记录/握手切分、TCP 流按 seq 重组、ClientHello/ServerHello 加密套件与 SNI/ALPN 扩展、证书链含国密 SM2 证书、ServerKeyExchange、Client⇄Server 双向流重组、TLCP 拨号业务通道前置报文跳过）
-    ├── handshake_view.py    # 握手时序图：TLS/TLCP/SSH 协商事件、协商结果汇总（含 SSH 双端协商算法）
+    ├── cssh_parser.py       # CSSH 国密 SSH（GM/T 0129-2023）解析：TCP 负载识别 CSSH-1.0 会话、传输层分帧重组、KEXINIT/KEX_REQUEST/KEX_REPLY/KEX 解析、服务端双证书提取、SM2 验签（随机数 ∥ 签名值）与国密算法高亮
+    ├── handshake_view.py    # 握手时序图：TLS/TLCP/SSH/CSSH 协商事件、协商结果汇总（含 SSH 双端协商算法、CSSH 双证书/验签/国密算法高亮）
     ├── handshake.py         # 握手消息解析辅助
-    └── packet_parser.py     # 单包全层字段树（Ethernet/IP/TCP/UDP/ICMP/DNS/HTTP/SSH/TLS/TLCP）+ 全 TCP 流级解析（含 SSH 客户端/服务端方向判定）+ Hex+ASCII 转储
+    └── packet_parser.py     # 单包全层字段树（Ethernet/IP/TCP/UDP/ICMP/DNS/HTTP/SSH/TLS/TLCP）+ 全 TCP 流级解析（含 SSH/CSSH 客户端/服务端方向判定）+ Hex+ASCII 转储
 ```
 
 ## 五、说明
 
 - SM2 采用标准国密曲线，签名算法 SM3withSM2，可与其他国密实现互通验签。
 - 核心算法与界面完全解耦，`modules/` 下均为纯 Python 逻辑，可脱离 GUI 复用或二次开发。
+- CSSH 国密 SSH 解析依据 GM/T 0129-2023：自动定位 `CSSH-1.0` 会话、按 RFC 4253 分帧重组，提取服务端双证书并完成 SM2 验签（验签依赖 `gmssl`；未安装时结论显示为「未能验签」并提示，不影响其余解析）。
 - 本项目以 **GPL-3.0** 协议开源，详见 `LICENSE`；仓库不包含真实抓包测试数据。

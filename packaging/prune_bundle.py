@@ -3,7 +3,8 @@
 
 策略：
   1. 移除未使用的可选组件：FFmpeg 多媒体库（会把 openEuler 的 libssl.so.3 拖进来）、
-     GTK3 主题插件（libqgtk3.so 依赖 GTK 全家桶）、PDF 插件（依赖 libatomic.so.1）；
+     GTK3 主题插件（libqgtk3.so 依赖 GTK 全家桶）、PDF 插件（依赖 libatomic.so.1）、
+     Wayland 平台后端（依赖目标机没有的 libwayland-*，目标机为 X11）；
   2. 扫描剩余 ELF，删除所有超出 buster 基线（GLIBC_2.28 / GLIBCXX_3.4.25 / CXXABI_1.3.11）的库
      —— 前提是该库名在「buster 系统自带」白名单中（运行时由目标系统提供）；
   3. 若仍有非白名单超标库（如 libssl.so.3），直接报错退出，避免打出静默损坏的包。
@@ -21,10 +22,14 @@ from target_libs import (GLIBC_LIMIT, GLIBCXX_LIMIT, CXXABI_LIMIT,  # noqa: E402
 FFMPEG_PAT = re.compile(r"^lib(avcodec|avformat|avutil|avdevice|avfilter|swresample|swscale|postproc)")
 MULTIMEDIA_PAT = re.compile(r"^libQt6(Multimedia|SpatialAudio|TextToSpeech|WebEngine|WebChannel)")
 PDF_PAT = re.compile(r"^libQt6Pdf")
-# 可选插件：多媒体/语音/TLS/GTK3 主题(会把 GTK 全家桶拉成未满足依赖)/PDF 图像插件
+# Wayland 后端：目标机为 X11 桌面，剔除可去掉 libwayland-* 依赖
+WAYLAND_PAT = re.compile(r"^libQt6(Wayland|WlShellIntegration)")
+# 可选插件：多媒体/语音/TLS/GTK3 主题(会把 GTK 全家桶拉成未满足依赖)/Wayland/PDF 图像插件
 DROP_PLUGIN_PAT = re.compile(
-    r"(plugins[/\\](multimedia|texttospeech|tls|platformthemes)[/\\]"
-    r"|imageformats[/\\]libqpdf)")
+    r"(plugins[/\\](multimedia|texttospeech|tls|platformthemes"
+    r"|wayland-decoration-client|wayland-graphics-integration-client|wayland-shell-integration)[/\\]"
+    r"|imageformats[/\\]libqpdf"
+    r"|platforms[/\\]libqwayland)")
 
 # 这些库目标系统（Debian 10）没有同名版本（有 .so.1.1 而非 .so.3），
 # 只有在确认产物中已无文件引用它们时才允许删除
@@ -62,7 +67,8 @@ def main():
             path = os.path.join(dirpath, fn)
             name = fn
             if (FFMPEG_PAT.match(name) or MULTIMEDIA_PAT.match(name)
-                    or PDF_PAT.match(name) or DROP_PLUGIN_PAT.search(path)):
+                    or PDF_PAT.match(name) or WAYLAND_PAT.match(name)
+                    or DROP_PLUGIN_PAT.search(path)):
                 try:
                     os.remove(path)
                     removed.append(path)

@@ -12,6 +12,7 @@
 | ④ 证书分析 | 解析 PEM / DER 证书：版本、序列号、签名算法、签发者、有效期、公钥、指纹、自签名判断，兼容国密 SM2 证书 |
 | ⑤ 对称加解密 | SM4 / AES（128/192/256），ECB / CBC / CFB / OFB / CTR / GCM，PKCS7 填充，随机密钥/IV 生成 |
 | ⑥ 摘要 / HMAC | SM3 / MD5 / SHA-1 / SHA-224/256/384/512 一键全算，HMAC 消息认证码，支持文本 / 文件 |
+| ⑦ 进制转换 | 二进制 / 八进制 / 十进制 / 十六进制 互转（默认 十进制 → 十六进制），四进制全景同屏展示，支持负号与任意精度大整数 |
 
 ### ① 国密 SM2 / SM3
 - **SM2 签名** / **SM2 验签** / **SM2 加解密**。
@@ -50,6 +51,11 @@
 - 支持 HMAC 消息认证码：选择算法 + 输入密钥后计算。
 - 结果表格支持**右键复制**（复制该值 / 复制该行 / 复制全部摘要）；HMAC 结果可**右键复制**。
 
+### ⑦ 进制转换
+- 二进制 / 八进制 / 十进制 / 十六进制 互转，默认 **十进制 → 十六进制**。
+- 转换后同屏展示四种进制全景（目标进制置顶）；HEX 大写并按字节对齐补零，二进制按 8 位一组空格分隔。
+- 支持负号直传、任意精度大整数；输入自动去除空格 / 下划线 / 千分位逗号，兼容 0x / 0b / 0o 前缀，非法字符给出中文提示。
+
 ## 二、使用方法
 
 1. 启动程序后，在窗口上方页签栏选择要使用的模块。
@@ -58,6 +64,7 @@
 4. **结果**：逐字节审查可看输入区下方的「字节数 / 前若干字节」提示；表格结果支持右键复制。
 5. 协议分析流程：打开 pcap → 选择视图模式 → ① 模式点「协商过程总结 / 关键参数」查看握手时序与协商算法（CSSH 国密 SSH 抓包会自动识别并展示国密协商过程、双证书与 SM2 验签结论），② 模式点击报文行查看字段树，可用顶部过滤下拉框与搜索框缩小范围。
 6. 任意时刻可用各页「清空」按钮复位（协议分析页同时清空统计、表格与物联时序图）。
+7. 进制转换：选择源 / 目标进制（默认 十进制 → 十六进制），粘贴整数值后点击「转换」，结果区同屏展示四种进制全景，可一键复制。
 
 ## 三、不同系统的运行方式
 
@@ -87,6 +94,22 @@
   sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libegl1
   ```
 
+### 预编译绿色包（无需 Python 环境）
+- 获取方式：GitLab「构建 → 流水线 → 对应作业 → 下载产物」，或 GitHub「Actions → build-packages → 对应运行 → Artifacts」。
+- **Linux x86_64 绿色包**（面向凝思 Linx / Debian 10，glibc ≥ 2.28，X11 桌面）：
+  ```bash
+  tar -xzf CryptoAnalysisTool-linux-x86_64.tar.gz
+  cd CryptoAnalysisTool
+  ./CryptoAnalysisTool
+  ```
+  该包已随包携带 `libxcb-cursor.so.0`（取自 Debian 10 官方仓库，glibc 2.8）及其余 xcb 平台库，
+  CI 通过 `ldd` 自包含门禁与 Xvfb 下真实加载 xcb 插件冒烟，正常无需再装系统库。
+  若仍提示 `Could not load the Qt platform plugin "xcb"`，说明目标机缺少基础图形库，可安装：
+  ```bash
+  sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libgl1 libegl1
+  ```
+- **Windows 绿色包**：解压 `CryptoAnalysisTool-win-x64.zip`，双击 `CryptoAnalysisTool.exe` 即可。
+
 ### macOS
 - 手动运行（与 Linux 相同）：
   ```bash
@@ -104,13 +127,14 @@
 
 ```
 CryptoAnalysisTool/
-├── main.py                  # 主程序（PySide6 界面，六个页签）
+├── main.py                  # 主程序（PySide6 界面，七个页签）
 ├── run.bat                  # Windows 一键启动脚本（自检依赖）
 ├── run.sh                   # Linux 一键启动脚本（自检依赖）
 ├── requirements.txt         # Python 依赖清单
 └── modules/
     ├── sm2_sm3.py           # 国密 SM2 密钥/签名/验签/加解密、SM3 摘要、多格式签名公钥归一化
     ├── codec.py             # 常用编码转换核心逻辑
+    ├── radix.py             # 进制转换核心（二/八/十/十六进制互转，任意精度整数）
     ├── sym_crypto.py        # SM4 / AES 对称加解密（ECB/CBC/CFB/OFB/CTR/GCM + PKCS7）
     ├── hash_tools.py        # SM3/SHA 族/MD5 摘要 + HMAC 核心逻辑
     ├── pcap_analysis.py     # pcap 协议分析（包统计/分布/明细、协议过滤搜索、SSH 报文列表反标）
@@ -127,4 +151,3 @@ CryptoAnalysisTool/
 - SM2 采用标准国密曲线，签名算法 SM3withSM2，可与其他国密实现互通验签。
 - 核心算法与界面完全解耦，`modules/` 下均为纯 Python 逻辑，可脱离 GUI 复用或二次开发。
 - CSSH 国密 SSH 解析依据 GM/T 0129-2023：自动定位 `CSSH-1.0` 会话、按 RFC 4253 分帧重组，提取服务端双证书并完成 SM2 验签（验签依赖 `gmssl`；未安装时结论显示为「未能验签」并提示，不影响其余解析）。
-- 本项目以 **GPL-3.0** 协议开源，详见 `LICENSE`；仓库不包含真实抓包测试数据。

@@ -22,7 +22,7 @@ jobs:
             printf "deb http://archive.debian.org/debian buster main\ndeb http://archive.debian.org/debian-security buster/updates main\n" > /etc/apt/sources.list
             apt-get -o Acquire::Check-Valid-Until=false update -qq
             apt-get install -y -qq --no-install-recommends \
-              binutils ca-certificates xvfb \
+              python3 binutils ca-certificates xvfb \
               libgl1 libegl1 libgl1-mesa-dri libglx-mesa0 \
               libxkbcommon0 libxkbcommon-x11-0 libx11-6 libxcb1 libdbus-1-3 libfontconfig1
             bash packaging/ci_linux_build.sh

@@ -28,7 +28,8 @@ def check_gmssl():
 def check_scapy():
     import tempfile
     from scapy.all import Ether, IP, TCP, Raw, rdpcap, wrpcap
-    pkt = Ether() / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(sport=10022, dport=48380) / Raw(b"x")
+    pkt = (Ether(src="02:00:00:00:00:01", dst="02:00:00:00:00:02")
+           / IP(src="127.0.0.1", dst="127.0.0.1") / TCP(sport=10022, dport=48380) / Raw(b"x"))
     fd, path = tempfile.mkstemp(suffix=".pcap")
     os.close(fd)
     try:

@@ -3,6 +3,7 @@ name: build-packages
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -80,3 +81,41 @@ jobs:
           path: CryptoAnalysisTool-win-x64.zip
           retention-days: 90
           compression-level: 0
+
+  # 两个平台构建成功后发布到 GitHub Release，方便直接下载：
+  #   - 推送到 main：更新滚动发布 latest-build（资源覆盖，永远是最新构建）
+  #   - 推送 v* 标签：发布对应版本
+  release:
+    needs: [linux-x86_64, windows-x64]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          ls -lh release-assets
+          NOTES=$(printf '自动构建产物\n\n- 提交：%s\n- 运行：#%s\n- Linux x86_64：Debian 10 / glibc 2.28 / X11，自包含绿色包\n- Windows x64：免安装绿色包\n' "${SHA:0:7}" "${RUN_NUMBER}")
+          if [ "${REF_TYPE}" = "tag" ]; then
+            TAG="${REF_NAME}"
+            gh release view "$TAG" >/dev/null 2>&1 \
+              || gh release create "$TAG" --title "CryptoAnalysisTool ${TAG}" --notes "$NOTES"
+            gh release edit "$TAG" --title "CryptoAnalysisTool ${TAG}" --notes "$NOTES"
+          else
+            TAG="latest-build"
+            gh release view "$TAG" >/dev/null 2>&1 \
+              || gh release create "$TAG" --title "最新构建（latest-build）" --notes "$NOTES" --target "$SHA"
+            gh release edit "$TAG" --title "最新构建（latest-build）" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" release-assets/* --clobber

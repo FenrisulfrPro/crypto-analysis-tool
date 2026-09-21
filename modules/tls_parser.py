@@ -1080,6 +1080,60 @@ def _msg_packet_no(segs, abs_seq):
     return None
 
 
+# ---------------------------------------------------------------- 验签原始素材
+# 这些字段只供 negotiation_verify 计算签名，不进入界面展示（analyze_flows 中剥离）。
+
+def _raw_ske(body: bytes):
+    """ServerKeyExchange → {params, scheme, sig}（TLS1.2）或 {sig, export}（TLCP）。"""
+    d = {}
+    if not body:
+        return d
+    ptype = body[0]
+    if ptype in (1, 2, 3) and len(body) > 4:
+        off = 1
+        if ptype == 3 and off + 2 < len(body):
+            off += 2
+            plen = body[off]
+            off += 1 + plen
+        if off + 4 <= len(body):
+            scheme, slen = struct.unpack(">HH", body[off:off + 4])
+            d["params"] = body[:off]
+            d["scheme"] = scheme
+            d["sig"] = body[off + 4:off + 4 + slen]
+    elif len(body) >= 2:
+        slen = struct.unpack(">H", body[0:2])[0]
+        d["sig"] = body[2:2 + slen]
+        d["export"] = True
+    return d
+
+
+def _raw_cv(body: bytes):
+    """CertificateVerify → {scheme, sig}（TLS）或 {sig, export}（TLCP 长度前缀 + DER）。"""
+    d = {}
+    if len(body) >= 3 and body[2] == 0x30:
+        slen = struct.unpack(">H", body[0:2])[0]
+        if 2 + slen == len(body):
+            d["sig"] = body[2:2 + slen]
+            d["export"] = True
+            return d
+    if len(body) >= 4:
+        scheme, slen = struct.unpack(">HH", body[0:4])
+        d["scheme"] = scheme
+        d["sig"] = body[4:4 + slen]
+    return d
+
+
+def _raw_for(mt: int, body: bytes):
+    """验签所需的原始随机数 / 签名参数（按消息类型）。"""
+    if mt in (1, 2):
+        return {"random": body[2:34]} if len(body) >= 34 else {}
+    if mt == 12:
+        return _raw_ske(body)
+    if mt == 15:
+        return _raw_cv(body)
+    return {}
+
+
 def _parse_record_stream(data: bytes, direction: str, base: int, proto: str, segs=None):
     """把单方向已重组的字节流解析为 TLS/TLCP 明文握手消息列表。
 
@@ -1108,7 +1162,7 @@ def _parse_record_stream(data: bytes, direction: str, base: int, proto: str, seg
             name = HANDSHAKE_TYPE.get(mt, "type%d" % mt)
             fields = _fields_for(mt, body, proto)
             summary = _summary_for(mt, fields)
-            out_msgs.append({
+            msg = {
                 "dir": direction,
                 "proto": proto,
                 "type": name,
@@ -1116,7 +1170,11 @@ def _parse_record_stream(data: bytes, direction: str, base: int, proto: str, seg
                 "fields": fields,
                 "offset": base + rec_off + msg_off,
                 "no": _msg_packet_no(segs, base + rec_off + msg_off),
-            })
+            }
+            raw = _raw_for(mt, body)
+            if raw:
+                msg["_raw"] = raw
+            out_msgs.append(msg)
     return out_msgs
 
 
@@ -1186,6 +1244,12 @@ def analyze_flows(pkts):
         if not conv_msgs:
             continue
         conv_msgs.sort(key=lambda x: x["offset"])
+        # 协商过程验签（TLS 1.2 / TLCP）：结论写入消息 fields，原始素材随后剥离
+        try:
+            from . import negotiation_verify as _nv
+            _nv.attach_flow_verify(conv_msgs, flow_proto)
+        except Exception:
+            pass
         client, server = ("%s:%d" % (a, ap), "%s:%d" % (b, bp))
         # 客户端 = ClientHello 的来源方向（比首条消息方向更可靠）；
         # 无 ClientHello 时退回 TCP 发起方（SYN 源）方向；仍未知再退回首条消息方向
@@ -1204,7 +1268,8 @@ def analyze_flows(pkts):
             "client": client,
             "server": server,
             "proto": flow_proto or "TLS",
-            "messages": [{k: v for k, v in m.items() if k != "offset"} for m in conv_msgs],
+            "messages": [{k: v for k, v in m.items() if k not in ("offset", "_raw")}
+                         for m in conv_msgs],
         }
 
     overview = OrderedDict()

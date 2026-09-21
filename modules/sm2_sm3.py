@@ -322,7 +322,7 @@ def sm2_verify_ex(msg: bytes, sig_text: str, pub_text: str,
                   sm2_id: str = None, msg_is_za_m: bool = False) -> tuple:
     """SM2-with-SM3 验签（底层版，支持显式字节消息或直接给定 e 值）。
 
-    支持两种消息输入形态：
+    对齐同类密码算法工具两种消息输入形态：
     - 消息M：msg_is_za_m=False（默认），msg 为消息原文/HEX/文件字节，内部计算 e=Hash(Za||M)
     - Hash(Za||M)：msg_is_za_m=True，msg 直接作为 e 值（32 字节）参与验签，跳过 Hash 计算
 

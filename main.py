@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""密码算法分析工具 - PySide6 桌面版
+"""密码算法分析工具 - PySide6 桌面版（浅蓝风格 UI）
 模块：国密SM2/SM3 | 编码转换 | 协议分析(pcap) | 证书分析
 """
 import sys
@@ -10,7 +10,8 @@ import warnings
 warnings.filterwarnings("ignore", message=".*Diffie-Hellman over finite fields.*")
 warnings.filterwarnings("ignore", message="scapy.*TLS.*")
 
-from PySide6.QtCore import Qt, QRect, QPoint, QSize as PY_QSIZE, Signal, QTimer, QElapsedTimer, QEvent
+from PySide6.QtCore import (Qt, QRect, QPoint, QSize as PY_QSIZE, Signal, QTimer,
+                            QElapsedTimer, QEvent, QObject, QThread, Slot)
 from PySide6.QtGui import (QFont, QPainter, QColor, QPen, QBrush, QPolygon,
                            QLinearGradient, QTextDocument, QFontMetrics)
 from PySide6.QtWidgets import (
@@ -25,13 +26,13 @@ from PySide6.QtWidgets import (
 sys.path.insert(0, '.')
 
 from modules import sm2_sm3, codec, pcap_analysis, cert_analysis, packet_parser
-from modules import sym_crypto, hash_tools, handshake_view
+from modules import sym_crypto, hash_tools, handshake_view, radix
 TCP = packet_parser.TCP
 
-APP_TITLE = "密码算法分析工具 v2.1"
+APP_TITLE = "密码算法分析工具 v2.2"
 MONO = "Consolas"
 
-# ============================================================ 全局样式
+# ============================================================ 全局样式（浅蓝主题）
 QSS = """
 QWidget {
     font-family: "Microsoft YaHei UI", "Microsoft YaHei";
@@ -139,6 +140,36 @@ QLabel#stateLabel {
 QLabel#statePending { background: #f3f4f6; color: #6b7280; }
 QLabel#stateOk  { background: #dcfce7; color: #15803d; }
 QLabel#stateBad { background: #fee2e2; color: #b91c1c; }
+
+/* ---- 细节美化（v2.2）：标签不再继承灰底、弹窗/浏览器/滚动条统一风格 ---- */
+QLabel { background: transparent; }
+QDialog { background: #f3f6fb; }
+QTextBrowser, QTextEdit {
+    background: #ffffff;
+    border: 1px solid #dde3ee;
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical {
+    background: #c7d2fe; border-radius: 5px; min-height: 24px;
+}
+QScrollBar::handle:vertical:hover { background: #a5b4fc; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal {
+    background: #c7d2fe; border-radius: 5px; min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: #a5b4fc; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QGroupBox {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #ffffff, stop:1 #fbfdff);
+}
+QToolTip {
+    background: #1f2937; color: #f9fafb; border: none;
+    padding: 4px 8px; border-radius: 4px;
+}
 """
 
 
@@ -152,7 +183,182 @@ def _hex_nbytes(hex_str: str) -> int:
     return len(s) // 2
 
 
-# ============================================================ 国密 SM2 / SM3
+# ============================================================ 文件加载动画（转圈遮罩 + 后台执行）
+# 所有「上传/选择文件」入口统一使用：加载期间覆盖一层半透明遮罩 + 旋转指示器，
+# 文件读取与解析放到后台线程执行，界面保持响应，处理完成后回到主线程刷新。
+
+class BusyOverlay(QWidget):
+    """半透明遮罩 + 旋转圆弧 + 文案（覆盖父控件区域，指示文件仍在处理中）。"""
+
+    def __init__(self, parent, text="正在处理…"):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background: rgba(243, 246, 251, 0.78);")
+        self._angle = 0
+        self._text = text
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 14) % 360
+        self.update()
+
+    def start(self, text=None):
+        if text:
+            self._text = text
+        pw = self.parentWidget()
+        if pw is not None:
+            self.setGeometry(pw.rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = self.width() // 2, self.height() // 2 - 14
+        r = 17
+        pen = QPen(QColor("#DBEAFE"))
+        pen.setWidth(4)
+        p.setPen(pen)
+        p.drawEllipse(cx - r, cy - r, 2 * r, 2 * r)
+        pen = QPen(QColor("#3B82F6"))
+        pen.setWidth(4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(cx - r, cy - r, 2 * r, 2 * r, int(self._angle * 16), 260 * 16)
+        p.setPen(QColor("#1F2937"))
+        f = QFont("Microsoft YaHei UI", 10)
+        p.setFont(f)
+        p.drawText(self.rect().adjusted(0, 30, 0, 0),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self._text)
+
+
+class _BusyWorker(QObject):
+    """后台执行函数并发回结果（不创建任何 Qt 控件，仅发信号）。"""
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    @Slot()
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:  # 异常文本带回主线程展示
+            self.failed.emit(str(e))
+
+
+class _BusyController(QObject):
+    """主线程侧回调接收器（保证 on_done / on_error 在 GUI 线程执行）。"""
+
+    def __init__(self, on_done, on_error, owner=None):
+        super().__init__(owner)
+        self._on_done = on_done
+        self._on_error = on_error
+
+    @Slot(object)
+    def handle_done(self, res):
+        if self._on_done:
+            self._on_done(res)
+
+    @Slot(str)
+    def handle_fail(self, msg):
+        if self._on_error:
+            self._on_error(msg)
+
+
+def run_async(owner, work, on_done=None, on_error=None):
+    """在后台线程执行 work()，完成后回主线程调用 on_done(result) / on_error(msg)。
+
+    owner 用于持有 QThread / 工作对象引用，避免被回收。"""
+    thread = QThread(owner)
+    worker = _BusyWorker(work)
+    state = {"t": thread, "w": None, "c": None}
+    if not hasattr(owner, "_busy_jobs"):
+        owner._busy_jobs = []
+    owner._busy_jobs.append(state)
+
+    def _finish():
+        try:
+            thread.quit()
+            thread.wait(3000)
+        except Exception:
+            pass
+        try:
+            owner._busy_jobs.remove(state)
+        except Exception:
+            pass
+
+    def _wrapped_done(res):
+        try:
+            if on_done:
+                on_done(res)
+        finally:
+            _finish()
+
+    def _wrapped_fail(msg):
+        try:
+            if on_error:
+                on_error(msg)
+        finally:
+            _finish()
+
+    # 控制器归属主线程，保证回调在 GUI 线程执行；回调结束后再收尾线程
+    ctrl = _BusyController(_wrapped_done, _wrapped_fail, owner)
+    state["w"], state["c"] = worker, ctrl
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)          # 在后台线程执行
+    worker.done.connect(ctrl.handle_done)       # queued → 回主线程
+    worker.failed.connect(ctrl.handle_fail)     # queued → 回主线程
+    thread.start()
+    return state
+
+
+def busy_load(owner, text, work, on_done=None, on_error=None):
+    """显示加载动画并在后台执行 work()：owner 需为 QWidget（遮罩覆盖在其上）。
+
+    完成后自动隐藏动画；返回遮罩对象（owner._busy_overlay 同时记录，便于测试等待）。"""
+    overlay = BusyOverlay(owner, text)
+    owner._busy_overlay = overlay
+    overlay.start()
+
+    def _done(res):
+        overlay.stop()
+        owner._busy_overlay = None
+        if on_done:
+            on_done(res)
+
+    def _fail(msg):
+        overlay.stop()
+        owner._busy_overlay = None
+        if on_error:
+            on_error(msg)
+
+    run_async(owner, work, _done, _fail)
+    return overlay
+
+
+def wait_busy(owner, timeout_s=120.0):
+    """（测试/脚本用）等待 owner 上的加载动画结束。"""
+    import time as _time
+    t0 = _time.time()
+    app = QApplication.instance()
+    while getattr(owner, "_busy_overlay", None) is not None and _time.time() - t0 < timeout_s:
+        if app is not None:
+            app.processEvents()
+        _time.sleep(0.02)
+
+
+# ============================================================ 国密 SM2 / SM3（重构）
 # ---------------------------------------------------------- SM2 签名 / 验签 / 加解密（拆分子页）
 
 class _Sm2MsgMixin:
@@ -244,16 +450,21 @@ class _Sm2MsgMixin:
             self._load_msg_file(path)
 
     def _load_msg_file(self, path):
-        try:
+        """导入消息文件：显示加载动画，读取在后台线程执行后填入消息区。"""
+        def work():
             with open(path, 'rb') as f:
-                raw = f.read()
-        except Exception as ex:
-            QMessageBox.critical(self, "读取失败", str(ex))
-            return
-        self.rb_msg.setChecked(True)
-        self.rb_hex.setChecked(True)
-        self.msg_edit.setPlainText(raw.hex())
-        self._append_res("[文件] %s\n已载入 %d 字节并转为 HEX" % (path, len(raw)))
+                return f.read()
+
+        def done(raw):
+            self.rb_msg.setChecked(True)
+            self.rb_hex.setChecked(True)
+            self.msg_edit.setPlainText(raw.hex())
+            self._append_res("[文件] %s\n已载入 %d 字节并转为 HEX" % (path, len(raw)))
+
+        def failed(msg):
+            QMessageBox.critical(self, "读取失败", msg)
+
+        busy_load(self, "正在读取文件…", work, done, failed)
 
     # ---------------------------------------------------------- 消息文件拖拽
     def dragEnterEvent(self, e):
@@ -303,6 +514,13 @@ class _Sm2SignPanel(_Sm2MsgMixin, QWidget):
 
         key_box = QGroupBox("SM2 密钥（签名需同时提供私钥与公钥）")
         key_grid = QGridLayout(key_box)
+        # 比例：标签列固定宽、输入列占满剩余（避免标签灰底过宽挤压输入框）
+        key_grid.setColumnMinimumWidth(0, 96)
+        key_grid.setColumnStretch(0, 0)
+        key_grid.setColumnStretch(1, 1)
+        key_grid.setColumnStretch(2, 0)
+        key_grid.setHorizontalSpacing(10)
+        key_grid.setVerticalSpacing(8)
         key_grid.addWidget(QLabel("私钥 d"), 0, 0)
         self.priv_edit = QLineEdit()
         key_grid.addWidget(self.priv_edit, 0, 1)
@@ -426,6 +644,13 @@ class _Sm2VerifyPanel(_Sm2MsgMixin, QWidget):
 
         cfg_box = QGroupBox("验签参数")
         cfg = QGridLayout(cfg_box)
+        # 比例：标签列固定宽（灰底已透明），输入框占满剩余宽度
+        cfg.setColumnMinimumWidth(0, 96)
+        cfg.setColumnStretch(0, 0)
+        cfg.setColumnStretch(1, 1)
+        cfg.setColumnStretch(2, 0)
+        cfg.setHorizontalSpacing(10)
+        cfg.setVerticalSpacing(8)
         cfg.addWidget(QLabel("公钥 P"), 0, 0)
         self.pub_edit = QLineEdit()
         self.pub_edit.setFont(QFont(MONO, 10))
@@ -561,6 +786,13 @@ class _Sm2EncDecPanel(_Sm2MsgMixin, QWidget):
 
         key_box = QGroupBox("SM2 密钥")
         key_grid = QGridLayout(key_box)
+        # 比例：标签列固定宽（灰底已透明），输入框占满剩余宽度
+        key_grid.setColumnMinimumWidth(0, 96)
+        key_grid.setColumnStretch(0, 0)
+        key_grid.setColumnStretch(1, 1)
+        key_grid.setColumnStretch(2, 0)
+        key_grid.setHorizontalSpacing(10)
+        key_grid.setVerticalSpacing(8)
         key_grid.addWidget(QLabel("公钥 P（加密用）"), 0, 0)
         self.pub_edit = QLineEdit()
         self.pub_edit.setFont(QFont(MONO, 10))
@@ -801,7 +1033,7 @@ class CodecTab(QWidget):
 # 客户端在左、服务端在右，虚线生命线 + 带箭头斜线表示报文的发送方向，
 # 仿 TCP 三次握手示意图；每条消息左侧圆圈标注序号（时间顺序）。
 class HandshakeView(QWidget):
-    """密钥协商过程视图：
+    """密钥协商过程视图（模仿 「协商过程详情」样式）：
     - 白 → #EFF6FF 纵向渐变背景
     - 左右两侧全高彩色生命线：客户端天蓝 #93C5FD / 服务端淡红 #FCA5A5，端点标签 + 设备图标
     - 中央灰色时间轴；消息按发送方左右交替排布
@@ -1030,6 +1262,9 @@ class HandshakeView(QWidget):
     def _content_html(self, e):
         divs = []
         fields = e.get("fields") or []
+        title = e.get("title") or ""
+        if title in ("ServerKeyExchange", "CertificateVerify", "ServerHello") and fields:
+            self._append_verify_badge(divs, dict(fields))
         if not fields:
             d = (e.get("detail") or "").strip()
             if d:
@@ -1068,6 +1303,28 @@ class HandshakeView(QWidget):
     @staticmethod
     def _clip(s, n):
         return s if len(s) <= n else s[:n] + "…"
+
+    @staticmethod
+    def _append_verify_badge(divs, fd):
+        """在消息卡片首页追加验签徽标（TLS / TLCP 的 ServerKeyExchange / CertificateVerify）。"""
+        ok = fd.get("验签结果")
+        if not ok:
+            return
+        if ok == "通过":
+            badge = ("<span style='background:#DCFCE7;color:#15803D;border-radius:3px;"
+                     "padding:0 5px;font-weight:bold'>验签通过 ✓</span>")
+        elif ok == "失败":
+            badge = ("<span style='background:#FEE2E2;color:#B91C1C;border-radius:3px;"
+                     "padding:0 5px;font-weight:bold'>验签失败 ✗</span>")
+        else:
+            badge = ("<span style='background:#FEF3C7;color:#92400E;border-radius:3px;"
+                     "padding:0 5px;font-weight:bold'>未能验签 ⚠</span>")
+        alg = fd.get("签名算法") or "签名验证"
+        divs.append("<div><span style='color:#374151'>身份鉴别（%s）：</span>%s</div>"
+                    % (_html.escape(str(alg)), badge))
+        detail = fd.get("验签详情")
+        if detail:
+            divs.append("<div style='color:#6b7280'>%s</div>" % _html.escape(str(detail)))
 
     def _cert_html(self, fields):
         """Certificate 卡首页展示：证书值（公钥 / 算法 / 签名值 / 指纹等）直接放在视图里。"""
@@ -1479,21 +1736,28 @@ _CERT_LABELS = {
 
 
 class PacketDetailDialog(QDialog):
-    """单个通信消息的关键参数弹窗（时序图每卡「关键参数」按钮 / 点击消息框弹出，可多开）。"""
-    def __init__(self, title, text, parent=None):
+    """单个通信消息的关键参数弹窗（时序图每卡「关键参数」按钮 / 点击消息框弹出，可多开）。
+
+    内容按「块状卡片」展示：每部分参数一个卡片，长数据（HEX/签名值等）用等宽代码块
+    折行显示，完整不省略，便于阅读与手动核对。"""
+    def __init__(self, title, html, parent=None, plain_text=""):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(680, 500)
+        self.resize(760, 620)
         lay = QVBoxLayout(self)
-        txt = QPlainTextEdit()
-        txt.setReadOnly(True)
-        txt.setFont(QFont(MONO, 9))
-        txt.setPlainText(text)
-        lay.addWidget(txt, 1)
+        browse = QTextBrowser()
+        browse.setOpenExternalLinks(False)
+        browse.setFont(QFont("Microsoft YaHei UI", 9))
+        if html:
+            browse.setHtml(html)
+        else:
+            browse.setPlainText(plain_text or "")
+        lay.addWidget(browse, 1)
         btn = QPushButton("关闭")
         btn.clicked.connect(self.accept)
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
-        self.edit = txt
+        self.browser = browse
+        self.edit = browse
 
 
 class SummaryDialog(QDialog):
@@ -1517,11 +1781,14 @@ class SummaryDialog(QDialog):
 
 class CertDetailDialog(QDialog):
     """证书详情窗口：展示单张证书的全部关键字段（点击时序图「证书 N」按钮弹出），
-    并提供「导出证书 (.cer)」按钮把原始 DER 证书存到本地。"""
+    并提供「导出证书 (.cer)」按钮把原始 DER 证书存到本地。
+
+    版式：块状卡片 + 高亮签名算法 / 有效期 / 密钥用途；有效期与当前系统时间比对，
+    给出「有效 ✓（绿）/ 已过期 ✗（红）」标志。"""
     def __init__(self, cert_index, fields, parent=None):
         super().__init__(parent)
         self.setWindowTitle("证书详情 · 第 %d 张" % cert_index)
-        self.resize(700, 540)
+        self.resize(780, 640)
         lay = QVBoxLayout(self)
         head = QLabel("服务端证书 · 第 %d 张" % cert_index)
         head.setStyleSheet("font-size:13px; font-weight:bold; color:#1F2937;")
@@ -1543,12 +1810,106 @@ class CertDetailDialog(QDialog):
         btnrow.addWidget(btn_close)
         lay.addLayout(btnrow)
 
-        txt = QPlainTextEdit()
-        txt.setReadOnly(True)
-        txt.setFont(QFont(MONO, 9))
-        txt.setPlainText(self._format(fields))
-        lay.addWidget(txt, 1)
-        self.edit = txt
+        browse = QTextBrowser()
+        browse.setOpenExternalLinks(False)
+        browse.setFont(QFont("Microsoft YaHei UI", 9))
+        browse.setHtml(self._detail_html(fields, cert_index))
+        lay.addWidget(browse, 1)
+        self.browser = browse
+        self.edit = browse
+
+    # ------------------------------------------------------------ 版式（块状 + 高亮）
+
+    @staticmethod
+    def _parse_cert_time(s):
+        """'YYYY/M/D H:M:S'（无前导零）→ datetime；失败返回 None。"""
+        from datetime import datetime
+        try:
+            d, t = str(s).strip().split(" ")
+            y, mo, dd = d.split("/")
+            hh, mi, ss = t.split(":")
+            return datetime(int(y), int(mo), int(dd), int(hh), int(mi), int(ss))
+        except Exception:
+            return None
+
+    @classmethod
+    def _validity_badge(cls, fields):
+        """有效期与当前系统时间比对：有效（绿）/ 已过期（红）/ 未生效（红）。"""
+        nb = cls._parse_cert_time(fields.get("not_before"))
+        na = cls._parse_cert_time(fields.get("not_after"))
+        if not nb or not na:
+            return "", None
+        from datetime import datetime
+        now = datetime.now()
+        if nb <= now <= na:
+            return handshake_view._badge("有效 ✓", "#DCFCE7", "#15803D", "#BBF7D0"), "ok"
+        if now > na:
+            return handshake_view._badge("已过期 ✗", "#FEE2E2", "#B91C1C", "#FECACA"), "expired"
+        return handshake_view._badge("未生效 ✗", "#FEE2E2", "#B91C1C", "#FECACA"), "notyet"
+
+    @classmethod
+    def _detail_html(cls, fields, cert_index):
+        from html import escape
+        hv = handshake_view
+        out = []
+        subj = fields.get("subject") or "(未知)"
+        out.append(hv._card("<b style='font-size:13px;color:#1F2937'>%s</b>"
+                            "<span style='color:%s;font-size:11px'>　第 %d 张证书</span>"
+                            % (escape(str(subj)), hv.LABEL_COLOR, cert_index),
+                            accent=hv.ACCENT_BLUE))
+        if fields.get("issuer"):
+            out.append(hv._kv_block("颁发者", "<span style='%s'>%s</span>"
+                                    % (hv.VAL_CSS, escape(str(fields["issuer"])))))
+        # 有效期（高亮 + 有效/过期标志，标志放在本块内）
+        nb, na = fields.get("not_before"), fields.get("not_after")
+        if nb or na:
+            badge, _state = cls._validity_badge(fields)
+            val = ("%s<br><span style='%s'>%s</span>　→　<span style='%s'>%s</span>"
+                   % (badge,
+                      hv.VAL_CSS, escape(str(nb or "?")),
+                      hv.VAL_CSS, escape(str(na or "?"))))
+            out.append(hv._kv_block("有效期", val, color="#B45309",
+                                    accent=("#22C55E" if _state == "ok" else "#EF4444")))
+        # 签名算法（高亮）
+        if fields.get("sig_algorithm"):
+            chip = hv._badge(escape(str(fields["sig_algorithm"])), "#EFF6FF", "#1D4ED8", "#BFDBFE")
+            out.append(hv._kv_block("签名算法", chip, color="#1D4ED8", accent=hv.ACCENT_BLUE))
+        # 密钥用途 / 证书用途（高亮）
+        if fields.get("key_usage"):
+            chip = hv._badge(escape(str(fields["key_usage"])), "#FEF3C7", "#92400E", "#FDE68A")
+            out.append(hv._kv_block("密钥用途 (KeyUsage)", chip, color="#B45309",
+                                    accent=hv.ACCENT_AMBER))
+        if fields.get("ext_key_usage"):
+            chip = hv._badge(escape(str(fields["ext_key_usage"])), "#FEF3C7", "#92400E", "#FDE68A")
+            out.append(hv._kv_block("证书用途 (EKU)", chip, color="#B45309",
+                                    accent=hv.ACCENT_AMBER))
+        # 其余字段
+        for key in ("version", "serial", "pubkey", "pubkey_curve", "basic_constraints",
+                    "sha256_thumb", "sig_sha256", "error"):
+            if fields.get(key) not in (None, ""):
+                out.append(hv._kv_block(_CERT_LABELS.get(key, key),
+                                        "<span style='%s'>%s</span>"
+                                        % (hv.VAL_CSS, escape(str(fields[key])))))
+        # 长数据代码块
+        sv = str(fields.get("sig_value") or "")
+        if sv:
+            out.append(hv._code_block("完整签名值（%d 字节，HEX）" % (len(sv) // 2), sv))
+        der = str(fields.get("der_hex") or "")
+        if der:
+            out.append(hv._code_block("完整证书 DER（%d 字节，HEX）" % (len(der) // 2), der,
+                                      accent=hv.ACCENT_AMBER))
+        # 未在常用映射中的额外字段
+        known = {"version", "serial", "subject", "issuer", "not_before", "not_after",
+                 "sig_algorithm", "pubkey", "pubkey_curve", "key_usage", "ext_key_usage",
+                 "basic_constraints", "sha256_thumb", "sig_sha256", "sig_value", "der_hex",
+                 "error"}
+        for k, v in fields.items():
+            if k in known:
+                continue
+            out.append(hv._kv_block(_CERT_LABELS.get(k, k),
+                                    "<span style='%s'>%s</span>" % (hv.VAL_CSS, escape(str(v)))))
+        return ("<div style='font-family:\"Microsoft YaHei UI\",\"Microsoft YaHei\";"
+                "font-size:12px;color:#374151'>%s</div>" % "".join(out))
 
     @staticmethod
     def _export(fields):
@@ -1761,7 +2122,11 @@ class PcapTab(QWidget):
 
     def _on_packet_detail(self, ev):
         title = "关键参数 — 〔#%s〕 %s" % (ev.get("seq", ""), ev.get("title", ""))
-        self._open_dlg(PacketDetailDialog(title, handshake_view.event_detail_text(ev), self))
+        self._open_dlg(PacketDetailDialog(
+            title,
+            handshake_view.event_detail_html(ev),
+            self,
+            plain_text=handshake_view.event_detail_text(ev)))
 
     # ------------------------------------------------------------ 证书「N」按钮 → 详情弹窗（可多开）
     def _on_cert_detail(self, cert_index, fields):
@@ -1840,46 +2205,64 @@ class PcapTab(QWidget):
         self.analyze_file(p)
 
     def analyze_file(self, path):
-        try:
+        """加载抓包：显示加载动画，解析在后台线程执行，完成后刷新界面。"""
+        want_diagram = self.mode_combo.currentData() == 2
+
+        def work():
             a = pcap_analysis.analyze_pcap(path, max_rows=200000)
-        except Exception as e:
-            QMessageBox.critical(self, "解析失败", str(e))
-            return
-        try:
-            from scapy.all import rdpcap
-            self._pkts = rdpcap(path)
-        except Exception:
-            self._pkts = []
+            try:
+                from scapy.all import rdpcap
+                pkts = rdpcap(path)
+            except Exception:
+                pkts = []
+            streams = None
+            if want_diagram and pkts:
+                # 时序图模式：顺带在后台完成流解析（较耗时）
+                try:
+                    streams = packet_parser.analyze_streams(pkts)
+                except Exception:
+                    streams = {}
+            return a, pkts, streams
 
-        self.path_label.setText(path)
-        s = a['summary']
-        self._file_summary = "共 %s 个数据包 | %s → %s | 时长 %.1f 秒" % (
-            s['文件包数'], s['起始时间'], s['结束时间'], s['时长(秒)'])
-        self.info_label.setText(self._file_summary)
+        def done(res):
+            a, self._pkts, pre_streams = res
+            try:
+                self.path_label.setText(path)
+                s = a['summary']
+                self._file_summary = "共 %s 个数据包 | %s → %s | 时长 %.1f 秒" % (
+                    s['文件包数'], s['起始时间'], s['结束时间'], s['时长(秒)'])
+                self.info_label.setText(self._file_summary)
 
-        self._all_rows = a['rows']
-        self._all_pkts = self._pkts[:len(self._all_rows)]
-        self._streams = None
-        self._row_flow = []
-        self.flow_combo.clear()
-        self.cmb_proto.setCurrentIndex(0)
-        self.search_edit.clear()
-        self.btn_export.setEnabled(True)
-        self._apply_filter()
-        self.detail_tree.clear()
-        self.detail_edit.clear()
-        self.btn_flow.setEnabled(True)
-        self.btn_flow_raw.setEnabled(True)
+                self._all_rows = a['rows']
+                self._all_pkts = self._pkts[:len(self._all_rows)]
+                self._streams = pre_streams
+                self._row_flow = []
+                self.flow_combo.clear()
+                self.cmb_proto.setCurrentIndex(0)
+                self.search_edit.clear()
+                self.btn_export.setEnabled(True)
+                self._apply_filter()
+                self.detail_tree.clear()
+                self.detail_edit.clear()
+                self.btn_flow.setEnabled(True)
+                self.btn_flow_raw.setEnabled(True)
 
-        self._summary_html = ""
-        self._summary_title = "协商过程总结"
-        self.btn_summary.setEnabled(False)
+                self._summary_html = ""
+                self._summary_title = "协商过程总结"
+                self.btn_summary.setEnabled(False)
 
-        # 默认视图为 ① 密钥协商过程：加载后立即渲染
-        if self.mode_combo.currentData() == 2:
-            self.stack.setCurrentIndex(1)
-            self._ensure_streams()
-            self._populate_flow_combo(select_key=None)
+                # 默认视图为 ① 密钥协商过程：加载后立即渲染
+                if self.mode_combo.currentData() == 2:
+                    self.stack.setCurrentIndex(1)
+                    self._ensure_streams()
+                    self._populate_flow_combo(select_key=None)
+            except Exception as e:
+                QMessageBox.critical(self, "解析失败", str(e))
+
+        def failed(msg):
+            QMessageBox.critical(self, "解析失败", msg)
+
+        busy_load(self, "正在解析抓包文件…", work, done, failed)
 
     PROTO_BG = {  # Wireshark 风格协议配色
         "TLS": "#FDF3D8", "TLCP": "#FDF3D8", "SSH": "#E7F5E7", "HTTP": "#E7F5E7",
@@ -2263,20 +2646,29 @@ class CertTab(QWidget):
             self._load_file(path)
 
     def _load_file(self, path):
-        try:
+        """加载证书文件：显示加载动画，读取与分析在后台线程执行。"""
+        def work():
             with open(path, 'rb') as f:
                 raw = f.read()
-        except Exception as e:
-            QMessageBox.critical(self, "读取失败", str(e))
-            return
-        self._cert_path = path
-        text = raw.decode('utf-8', 'replace')
-        if '-----BEGIN' in text:
-            self.pem_edit.setPlainText(text)
-        else:
-            # DER：直接按文件解析
-            self.pem_edit.setPlainText("（DER 二进制证书，已按文件加载）")
-        self._parse()
+            text = raw.decode('utf-8', 'replace')
+            pem = text if '-----BEGIN' in text else None
+            fields = cert_analysis.analyze_cert(text=pem, path=path if pem is None else None)
+            return raw, text, fields
+
+        def done(res):
+            raw, text, fields = res
+            self._cert_path = path
+            if '-----BEGIN' in text:
+                self.pem_edit.setPlainText(text)
+            else:
+                # DER：直接按文件解析
+                self.pem_edit.setPlainText("（DER 二进制证书，已按文件加载）")
+            self._show_fields(fields)
+
+        def failed(msg):
+            QMessageBox.critical(self, "读取/解析失败", msg)
+
+        busy_load(self, "正在读取并分析证书…", work, done, failed)
 
     # ---------------------------------------------------------- 拖拽加载证书文件
     def dragEnterEvent(self, e):
@@ -2321,12 +2713,90 @@ class CertTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "解析失败", str(e))
             return
-        self.table.setRowCount(len(fields))
+        self._show_fields(fields)
+
+    def _show_fields(self, fields):
+        """把解析结果填入表格（有效期合并为一行 + 关键参数高亮）。"""
         self._last_fields = fields
-        for r, (k, v) in enumerate(fields.items()):
-            self.table.setItem(r, 0, QTableWidgetItem(k))
-            self.table.setItem(r, 1, QTableWidgetItem(str(v)))
+        rows = self._build_rows(fields)
+        self.table.setRowCount(len(rows))
+        for r, (k, v, style) in enumerate(rows):
+            it0 = QTableWidgetItem(k)
+            it1 = QTableWidgetItem(str(v))
+            self._apply_row_style(it0, it1, style)
+            self.table.setItem(r, 0, it0)
+            self.table.setItem(r, 1, it1)
         self.table.resizeRowsToContents()
+
+    # ---------------------------------------------------------- 关键参数高亮 / 有效期标识
+
+    # 关键参数高亮配色（标签底色/字色 + 值底色/字色）
+    _HL_STYLES = {
+        "sig": {"lb": "#EFF6FF", "lf": "#1D4ED8", "vb": "#EFF6FF", "vf": "#1D4ED8"},
+        "ku": {"lb": "#FEF3C7", "lf": "#92400E", "vb": "#FFFBEB", "vf": "#92400E"},
+        "pub": {"lb": "#F0F9FF", "lf": "#0369A1", "vb": "#F0F9FF", "vf": "#0369A1"},
+        "valid_ok": {"lb": "#FEF3C7", "lf": "#B45309", "vb": "#ECFDF5", "vf": "#15803D"},
+        "valid_bad": {"lb": "#FEF3C7", "lf": "#B45309", "vb": "#FEF2F2", "vf": "#B91C1C"},
+    }
+
+    @staticmethod
+    def _validity_state(nb, na):
+        """有效期与当前系统时间比对：ok / expired / notyet / unknown。"""
+        import datetime as _dt
+        try:
+            b = _dt.datetime.strptime(str(nb), "%Y-%m-%d %H:%M:%S")
+            a = _dt.datetime.strptime(str(na), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "unknown"
+        now = _dt.datetime.now()
+        if b <= now <= a:
+            return "ok"
+        return "expired" if now > a else "notyet"
+
+    @classmethod
+    def _row_style(cls, key):
+        if key.startswith("签名算法"):
+            return "sig"
+        if key.startswith("密钥用途") or key.startswith("扩展密钥用途"):
+            return "ku"
+        if key.startswith("公钥算法"):
+            return "pub"
+        return ""
+
+    def _build_rows(self, fields):
+        """整理表格行：① 合并有效期为一行（起-止 + 有效/过期标识）；② 标记关键参数高亮。"""
+        rows = []
+        nb = fields.get("有效期从 notBefore")
+        na = fields.get("有效期至 notAfter")
+        validity_added = False
+        for k, v in fields.items():
+            if k in ("有效期从 notBefore", "有效期至 notAfter"):
+                if validity_added:
+                    continue
+                validity_added = True
+                state = self._validity_state(nb, na)
+                mark = {"ok": "有效 ✓", "expired": "已过期 ✗", "notyet": "未生效 ✗"}.get(state, "")
+                line = "%s-%s" % (nb or "?", na or "?")
+                if mark:
+                    line += "　%s" % mark
+                rows.append(("有效期", line, "valid_ok" if state == "ok" else
+                             ("valid_bad" if state in ("expired", "notyet") else "")))
+                continue
+            rows.append((k, str(v), self._row_style(k)))
+        return rows
+
+    def _apply_row_style(self, it0, it1, style):
+        st = self._HL_STYLES.get(style)
+        if not st:
+            return
+        it0.setBackground(QColor(st["lb"]))
+        it0.setForeground(QColor(st["lf"]))
+        it1.setBackground(QColor(st["vb"]))
+        it1.setForeground(QColor(st["vf"]))
+        for it in (it0, it1):
+            f = it.font()
+            f.setBold(True)
+            it.setFont(f)
 
     def _clear(self):
         """清空 PEM 输入、解析结果与已加载证书状态。"""
@@ -2407,7 +2877,7 @@ class CertTab(QWidget):
             return
         lines = ["证书分析结果"]
         lines.append("=" * 56)
-        for k, v in self._last_fields.items():
+        for k, v, _style in self._build_rows(self._last_fields):
             lines.append("%s：" % k)
             lines.append(str(v))
             lines.append("")
@@ -2648,16 +3118,21 @@ class SymCryptoTab(QWidget):
             self._load_file(path)
 
     def _load_file(self, path):
-        try:
+        """导入文件：显示加载动画，读取在后台线程执行后填入输入区。"""
+        def work():
             with open(path, 'rb') as f:
-                raw = f.read()
-        except Exception as ex:
-            QMessageBox.critical(self, "读取失败", str(ex))
-            return
-        self._file_data = raw
-        self.rb_hex.setChecked(True)
-        self.in_edit.setPlainText(raw.hex())
-        self._append_log("[文件] 已载入 %d 字节并转为 HEX：%s" % (len(raw), path))
+                return f.read()
+
+        def done(raw):
+            self._file_data = raw
+            self.rb_hex.setChecked(True)
+            self.in_edit.setPlainText(raw.hex())
+            self._append_log("[文件] 已载入 %d 字节并转为 HEX：%s" % (len(raw), path))
+
+        def failed(msg):
+            QMessageBox.critical(self, "读取失败", msg)
+
+        busy_load(self, "正在读取文件…", work, done, failed)
 
     # ---------------------------------------------------------- 加解密
     def _do_encrypt(self):
@@ -2854,15 +3329,20 @@ class HashTab(QWidget):
             self._load_file(path)
 
     def _load_file(self, path):
-        try:
+        """导入文件：显示加载动画，读取在后台线程执行后选中「文件」输入。"""
+        def work():
             with open(path, 'rb') as f:
-                raw = f.read()
-        except Exception as ex:
-            QMessageBox.critical(self, "读取失败", str(ex))
-            return
-        self._file_data = raw
-        self.rb_file.setChecked(True)
-        self.file_label.setText("已选文件：%s（%d 字节）" % (path, len(raw)))
+                return f.read()
+
+        def done(raw):
+            self._file_data = raw
+            self.rb_file.setChecked(True)
+            self.file_label.setText("已选文件：%s（%d 字节）" % (path, len(raw)))
+
+        def failed(msg):
+            QMessageBox.critical(self, "读取失败", msg)
+
+        busy_load(self, "正在读取文件…", work, done, failed)
 
     # ---------------------------------------------------------- 计算
     def _do_hash(self):
@@ -2965,6 +3445,92 @@ class HashTab(QWidget):
 
 
 
+# ============================================================ 进制转换
+class RadixTab(QWidget):
+    """进制转换：二进制 / 八进制 / 十进制 / 十六进制 互转（默认 十进制 → 十六进制）"""
+    _BASE_ITEMS = [
+        ("bin", "二进制"),
+        ("oct", "八进制"),
+        ("dec", "十进制"),
+        ("hex", "十六进制"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("输入整数值："))
+
+        self.in_edit = QPlainTextEdit()
+        self.in_edit.setMaximumHeight(110)
+        root.addWidget(self.in_edit)
+
+        # 进制设置区
+        cfg = QGroupBox("进制设置")
+        g = QGridLayout(cfg)
+        g.addWidget(QLabel("源进制："), 0, 0)
+        self.src_combo = QComboBox()
+        for val, label in self._BASE_ITEMS:
+            self.src_combo.addItem(label, val)
+        self.src_combo.setCurrentIndex(self._BASE_ITEMS.index(("dec", "十进制")))
+        g.addWidget(self.src_combo, 0, 1)
+        g.addWidget(QLabel("目标进制："), 0, 2)
+        self.dst_combo = QComboBox()
+        for val, label in self._BASE_ITEMS:
+            self.dst_combo.addItem(label, val)
+        self.dst_combo.setCurrentIndex(self._BASE_ITEMS.index(("hex", "十六进制")))
+        g.addWidget(self.dst_combo, 0, 3)
+
+        self.btn_convert = QPushButton("转换")
+        self.btn_convert.clicked.connect(self._convert_from_cfg)
+        g.addWidget(self.btn_convert, 0, 4)
+
+        self.btn_clear = QPushButton("清空")
+        self.btn_clear.clicked.connect(self._clear)
+        g.addWidget(self.btn_clear, 0, 5)
+        root.addWidget(cfg)
+
+        root.addWidget(QLabel("结果（目标进制置顶，四种进制全景）："))
+        self.out_edit = QPlainTextEdit()
+        self.out_edit.setReadOnly(True)
+        self.out_edit.setFont(QFont(MONO, 10))
+        root.addWidget(self.out_edit)
+
+        act = QHBoxLayout()
+        self.btn_copy = QPushButton("复制结果")
+        self.btn_copy.clicked.connect(self._copy)
+        act.addWidget(self.btn_copy)
+        act.addStretch(1)
+        root.addLayout(act)
+
+    def _convert_from_cfg(self):
+        src = self.src_combo.currentData()
+        dst = self.dst_combo.currentData()
+        text = self.in_edit.toPlainText()
+        if not text.strip():
+            self.out_edit.setPlainText("")
+            return
+        try:
+            n = radix.parse_int(text, src)
+            lines = ["【%s】%s" % (radix.out_label(dst), radix.format_in(n, dst))]
+            for key, label, val in radix.all_bases(n):
+                if key != dst:
+                    lines.append("%s：%s" % (label, val))
+            self.out_edit.setPlainText("\n".join(lines))
+        except Exception as e:
+            self.out_edit.setPlainText("[转换失败] %s：%s" % (src + "→" + dst, e))
+
+    def _copy(self):
+        """复制结果区文本到剪贴板。"""
+        text = self.out_edit.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _clear(self):
+        """清空输入与输出（保留进制选择）。"""
+        self.in_edit.clear()
+        self.out_edit.clear()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2978,8 +3544,48 @@ class MainWindow(QMainWindow):
         tabs.addTab(CertTab(), "④ 证书分析")
         tabs.addTab(SymCryptoTab(), "⑤ 对称加解密 SM4/AES")
         tabs.addTab(HashTab(), "⑥ 摘要 / HMAC")
+        tabs.addTab(RadixTab(), "⑦ 进制转换")
         self.setCentralWidget(tabs)
         self.statusBar().showMessage("就绪 — 国密 SM2/SM3/SM4、TLS/TLCP 抓包与证书分析")
+
+
+def _place_window_on_screen(w):
+    """把主窗口放回主屏可用区域。
+
+    多显示器且排列异常（或系统记忆了旧位置）时，窗口可能被放到可视区域之外，
+    表现为「进程已启动但看不到窗口」；启动时统一校正到主屏，并在 show 之后再
+    校验一次标题栏是否可见（部分窗口管理器会把窗口再挪走）。
+    """
+    try:
+        from PySide6.QtCore import QTimer
+        from PySide6.QtGui import QGuiApplication
+    except Exception:
+        return
+    screen = QGuiApplication.primaryScreen() or next(iter(QGuiApplication.screens()), None)
+    if screen is None:
+        return
+    avail = screen.availableGeometry()
+    ww = min(max(w.width(), 800), avail.width())
+    hh = min(max(w.height(), 600), avail.height())
+    x = avail.left() + max(0, (avail.width() - ww) // 2)
+    y = avail.top() + max(0, (avail.height() - hh) // 2)
+    w.setGeometry(x, y, ww, hh)
+
+    def _ensure_visible():
+        a = screen.availableGeometry()
+        fg = w.frameGeometry()
+        if fg.top() < a.top():
+            w.move(w.x(), w.y() + (a.top() - fg.top()))
+            fg = w.frameGeometry()
+        if fg.left() < a.left():
+            w.move(w.x() + (a.left() - fg.left()), w.y())
+            fg = w.frameGeometry()
+        if (fg.top() < a.top() or fg.left() < a.left()
+                or fg.bottom() > a.bottom() or fg.right() > a.right()):
+            # 仍不可见（例如窗口大于屏幕）：退化为最大化，保证能用
+            w.showMaximized()
+
+    QTimer.singleShot(0, _ensure_visible)
 
 
 def main():
@@ -2987,10 +3593,11 @@ def main():
     app.setApplicationName(APP_TITLE)
     app.setStyleSheet(QSS)
     w = MainWindow()
+    _place_window_on_screen(w)
     w.show()
     w.raise_()
     w.activateWindow()
-    print("[OK] 密码算法分析工具 v2.1 已启动，主界面窗口已打开（请勿关闭此控制台）", flush=True)
+    print("[OK] 密码算法分析工具 v2.2 已启动，主界面窗口已打开（请勿关闭此控制台）", flush=True)
     sys.exit(app.exec())
 
 

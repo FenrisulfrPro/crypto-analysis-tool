@@ -2,6 +2,8 @@
 """裁剪 PyInstaller 产物中混入的构建宿主系统库，保证可在 Debian 10 (buster/凝思) 运行。
 
 策略：
+  0. 剔除构建机混入的 X11/XKB 系统库（整套不打，白名单见 target_libs.VENDORED_X11）
+     —— v2.1 段错误根因：只带新版 libxkbcommon-x11 却不带配套 libxkbcommon，ABI 错配；
   1. 移除未使用的可选组件：FFmpeg 多媒体库（会把 openEuler 的 libssl.so.3 拖进来）、
      GTK3 主题插件（libqgtk3.so 依赖 GTK 全家桶）、PDF 插件（依赖 libatomic.so.1）、
      Wayland 平台后端（依赖目标机没有的 libwayland-*，目标机为 X11）；
@@ -17,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from target_libs import (GLIBC_LIMIT, GLIBCXX_LIMIT, CXXABI_LIMIT,  # noqa: E402
-                         SYSTEM_OK)
+                         SYSTEM_OK, is_x11_xkb)
 
 FFMPEG_PAT = re.compile(r"^lib(avcodec|avformat|avutil|avdevice|avfilter|swresample|swscale|postproc)")
 MULTIMEDIA_PAT = re.compile(r"^libQt6(Multimedia|SpatialAudio|TextToSpeech|WebEngine|WebChannel)")
@@ -72,6 +74,16 @@ def main():
                 try:
                     os.remove(path)
                     removed.append(path)
+                except OSError:
+                    pass
+                continue
+            # X11/XKB 系统库：无论是否在白名单内，构建机拷贝一律先剔除；
+            # 必需的成套库由后续 vendor_libxcb_cursor.py 从目标发行版(buster)重新写入，
+            # 保证「成套且与目标机同源」（v2.1 段错误教训）。
+            if is_x11_xkb(name):
+                try:
+                    os.remove(path)
+                    removed.append(path + "  ← X11/XKB 系统库（由 buster 成套库替换）")
                 except OSError:
                     pass
                 continue

@@ -32,7 +32,7 @@ SYSTEM_OK = {
     "libxcb.so.1", "libxdmcp.so.6", "libbsd.so.0", "libxau.so.6", "libxkbcommon.so.0",
     "libxkbcommon-x11.so.0", "libfontconfig.so.1", "libfreetype.so.6", "libpng16.so.16",
     "libresolv.so.2", "libnsl.so.1", "libgdbm.so.6", "libgdbm_compat.so.4",
-    "libX11.so.6", "libXau.so.6", "libXdmcp.so.6", "libXext.so.6", "libXi.so.6",
+    "libX11.so.6", "libX11-xcb.so.1", "libXau.so.6", "libXdmcp.so.6", "libXext.so.6", "libXi.so.6",
     "libXrender.so.1", "libXfixes.so.3", "libXrandr.so.2", "libXcursor.so.1",
     "libXinerama.so.1", "libXcomposite.so.1", "libXdamage.so.1", "libXtst.so.6",
     "libSM.so.6", "libICE.so.6", "liblzma.so.5", "libgcrypt.so.20", "libcap.so.2",
@@ -44,12 +44,64 @@ DRIVER_RE = re.compile(
     r"^lib(GL|GLX|EGL|GLdispatch|OpenGL|glapi|drm|gbm|nvidia|nvcuvid|nvidia-|cuda|vdpau|va|XvMC)"
 )
 
+# ---------------------------------------------------------------- X11 / XKB 系统库
+# 教训（v2.1 段错误，退出码 139）：构建机上较新的 libxkbcommon-x11.so.0 被部分打进产物，
+# 而与之配套的 libxkbcommon.so.0 没打 → 目标机（Debian 10）自带的旧版 libxkbcommon 0.8.2
+# 被新版 x11 库调用，ABI 不匹配，在 xkb_x11_keymap_new_from_device 处崩溃。
+# 结论：这类 X11/XKB 系统库必须「成套打包或整套不打」，绝不能只带其中一部分。
+#
+# 本项目的策略：
+#   * 基础 X11/XKB（libX11/libxcb.so.1/libXau/libXdmcp/libX11-xcb）→ 整套不打，由目标机提供；
+#   * Qt xcb 插件必需的 xcb 辅助库与 xkbcommon 成套 → 统一从「目标发行版 buster」官方仓库取出
+#     （版本与目标机同源，见 VENDORED_X11），构建机自带的同名库一律剔除。
+X11_XKB_RE = re.compile(
+    r"^libxcb[-.]|^libX11|^libXext|^libXi\.|^libXrender|^libXfixes|^libXrandr|^libXcursor"
+    r"|^libXinerama|^libXcomposite|^libXdamage|^libXtst|^libXss|^libXxf86vm|^libXau|^libXdmcp"
+    r"|^libSM\.|^libICE\.|^libxkbcommon|^libxshmfence"
+)
+
+# 允许随包携带的 X11/XKB 家族库（全部取自 buster 官方 deb，glibc ≤ 2.28）：
+# 覆盖 Qt6 xcb 插件（libQt6XcbQpa / libqxcb / libqxcb-glx-integration）的完整依赖集合，
+# 且 libxkbcommon 与 libxkbcommon-x11 成对携带，杜绝版本错配。
+VENDORED_X11 = {
+    "libxcb-cursor.so.0",
+    "libxcb-glx.so.0",
+    "libxcb-icccm.so.4",
+    "libxcb-image.so.0",
+    "libxcb-keysyms.so.1",
+    "libxcb-randr.so.0",
+    "libxcb-render-util.so.0",
+    "libxcb-render.so.0",
+    "libxcb-shape.so.0",
+    "libxcb-shm.so.0",
+    "libxcb-sync.so.1",
+    "libxcb-util.so.0",
+    "libxcb-xfixes.so.0",
+    "libxcb-xkb.so.1",
+    "libxkbcommon.so.0",
+    "libxkbcommon-x11.so.0",
+}
+
 
 def is_allowed_system(name):
     """该库是否允许由目标系统/驱动提供（不随包携带）。"""
     if name in GLIBC_FAMILY or name in SYSTEM_OK:
         return True
     return bool(DRIVER_RE.match(name))
+
+
+def is_x11_xkb(name):
+    """是否属于 X11/XKB 系统库家族（必须成套处理）。"""
+    if not name:
+        return False
+    if name in VENDORED_X11:
+        return True
+    return bool(X11_XKB_RE.match(name))
+
+
+def is_forbidden_bundled(name):
+    """禁止随包携带的库：构建机拷贝的 X11/XKB 库（成套白名单之外的）。"""
+    return is_x11_xkb(name) and name not in VENDORED_X11
 
 
 def is_elf(path):

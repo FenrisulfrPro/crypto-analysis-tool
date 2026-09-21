@@ -58,6 +58,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --windowed --name CryptoAnalysisTool
           --distpath dist --workpath build --specpath build
           --collect-submodules scapy
+          --hidden-import modules.negotiation_verify
           --exclude-module matplotlib --exclude-module numpy --exclude-module PIL
           --exclude-module tkinter --exclude-module _tkinter
           main.py

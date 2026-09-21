@@ -71,6 +71,7 @@ echo "== PyInstaller 打包 =="
 "$PY" -m PyInstaller --noconfirm --clean --windowed --name CryptoAnalysisTool \
   --distpath dist --workpath build --specpath build \
   --collect-submodules scapy \
+  --hidden-import modules.negotiation_verify \
   --exclude-module matplotlib --exclude-module numpy --exclude-module PIL \
   --exclude-module tkinter --exclude-module _tkinter \
   main.py
@@ -78,7 +79,7 @@ echo "== PyInstaller 打包 =="
 echo "== 裁剪宿主系统库 =="
 "$PY" packaging/prune_bundle.py "$DIST"
 
-echo "== 补齐目标兼容版 libxcb-cursor.so.0 =="
+echo "== 补齐目标兼容版 X11/XKB 成套库（buster，16 个）=="
 "$PY" packaging/vendor_libxcb_cursor.py "$DIST"
 
 echo "== 门禁：符号版本兼容性 =="

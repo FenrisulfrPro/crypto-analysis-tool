@@ -27,6 +27,10 @@
 - 支持点击「选择 pcap / pcapng 文件」或直接把文件拖到本页加载（基于 scapy 解析）。
 - 两种视图模式：
   - **① 密钥协商过程（客户端 ⇄ 服务端）**：以时序卡片展示 TLS / TLCP / SSH / CSSH 握手交互。TLS/TLCP 显示 ClientHello → ServerHello → 证书链 → 密钥交换 → Finished 全过程及加密套件、SNI/ALPN、证书链（含国密 SM2 证书）；支持 TLCP **双向身份鉴别**、SSH 展示 KEXINIT 协商的**双端选定算法**（密钥交换/加密/MAC/压缩/主机密钥）；CSSH（国密 SSH）展示完整国密协商过程与 SM2 验签结论（见下）。
+  - **协商过程验签（v2.2 新增，覆盖 TLS / TLCP / SSH）**：在协商总结与消息卡片中给出「服务端身份鉴别」结论（验签通过 ✓ / 失败 ✗ / 未能验签 ⚠）：
+    - **TLS 1.2**：验证 ServerKeyExchange 数字签名（RSA-PKCS1 / RSA-PSS / ECDSA / Ed25519），签名数据 = `client_random ∥ server_random ∥ ServerKeyExchange.params`（RFC 5246 §7.4.3），并展示签名算法、所用证书与公钥；
+    - **TLCP**：按 GB/T 38636 §6.4.5.4 验证 ServerKeyExchange 的 SM2 签名，签名数据 = `client_random ∥ server_random ∥ ASN.1Cert`（3 字节长度 + 加密证书），用链中「签名证书」公钥验签、并标明被签入的加密证书；TLS 风格的双向鉴别（客户端 CertificateVerify）同步展示验签素材与结论；
+    - **TLS 1.3 / SSH**：被动抓包无法重算签名数据（TLS 1.3 的 CertificateVerify 在加密记录中；SSH 的交换哈希 H 依赖 DH 共享密钥 K），如实给出「未能验签」及原因；SSH 额外给出主机密钥类型、位数与 **SHA256 指纹**（可用于 TOFU 比对）。
   - **② 报文列表（Wireshark 式）**：逐包明细表，点击任意行弹出完整协议字段树（Ethernet / IP / TCP / UDP / ICMP / ARP / DNS / HTTP / SSH / TLS / TLCP），SSH 包自动标注客户端/服务端角色，可查看 TCP 流原文（Hex + ASCII）。
 - 支持协议下拉过滤 + 关键字条件搜索、导出 CSV。
 - **CSSH 国密 SSH 专项解析（GM/T 0129-2023）**：Wireshark 等工具无法识别 CSSH（只能看到 TCP），本工具直接深入 TCP 负载字节流检索并重组 CSSH 会话，在「① 密钥协商过程」视图中绘制完整国密握手时序：
@@ -102,8 +106,11 @@
   cd CryptoAnalysisTool
   ./CryptoAnalysisTool
   ```
-  该包已随包携带 `libxcb-cursor.so.0`（取自 Debian 10 官方仓库，glibc 2.8）及其余 xcb 平台库，
-  CI 通过 `ldd` 自包含门禁与 Xvfb 下真实加载 xcb 插件冒烟，正常无需再装系统库。
+  该包已随包携带 `libxcb-cursor.so.0`（取自 Debian 10 官方仓库，glibc 2.8）、
+  以及 Qt6 xcb 插件所需的整套 X11/XKB 辅助库（xcb-util/libxcb/libxkbcommon 共 16 个，全部取自
+  Debian 10 官方仓库且 libxkbcommon 与 libxkbcommon-x11 成对携带），
+  CI 通过 `ldd` 自包含门禁、X11/XKB「禁止部分打包」门禁与 Xvfb 下真实加载 xcb 插件冒烟，
+  正常无需再装系统库。
   若仍提示 `Could not load the Qt platform plugin "xcb"`，说明目标机缺少基础图形库，可安装：
   ```bash
   sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libgl1 libegl1
@@ -141,7 +148,8 @@ CryptoAnalysisTool/
     ├── cert_analysis.py     # X.509 证书分析核心逻辑（兼容国密 SM2 曲线 1.2.156.10197.1.301）
     ├── tls_parser.py        # TLS / TLCP 明文握手深度解析（记录/握手切分、TCP 流按 seq 重组、ClientHello/ServerHello 加密套件与 SNI/ALPN 扩展、证书链含国密 SM2 证书、ServerKeyExchange、Client⇄Server 双向流重组、TLCP 拨号业务通道前置报文跳过）
     ├── cssh_parser.py       # CSSH 国密 SSH（GM/T 0129-2023）解析：TCP 负载识别 CSSH-1.0 会话、传输层分帧重组、KEXINIT/KEX_REQUEST/KEX_REPLY/KEX 解析、服务端双证书提取、SM2 验签（随机数 ∥ 签名值）与国密算法高亮
-    ├── handshake_view.py    # 握手时序图：TLS/TLCP/SSH/CSSH 协商事件、协商结果汇总（含 SSH 双端协商算法、CSSH 双证书/验签/国密算法高亮）
+    ├── negotiation_verify.py # 协商过程验签（TLS 1.2 ServerKeyExchange、TLCP GB/T 38636 SM2 签名、TLS 1.3/SSH 可验证性判定），结论注入消息字段供时序图与总结渲染
+    ├── handshake_view.py    # 握手时序图：TLS/TLCP/SSH/CSSH 协商事件、协商结果汇总（含服务端身份鉴别/验签结论、SSH 双端协商算法与主机密钥指纹、CSSH 双证书/验签/国密算法高亮）
     ├── handshake.py         # 握手消息解析辅助
     └── packet_parser.py     # 单包全层字段树（Ethernet/IP/TCP/UDP/ICMP/DNS/HTTP/SSH/TLS/TLCP）+ 全 TCP 流级解析（含 SSH/CSSH 客户端/服务端方向判定）+ Hex+ASCII 转储
 ```

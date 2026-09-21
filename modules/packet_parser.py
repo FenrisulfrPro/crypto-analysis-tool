@@ -8,6 +8,8 @@
   - 应用层：DNS / HTTP / SSH / TLS / TLCP（国密 SSL）
 供主界面「协议分析 (pcap)」页点击数据包行时展示协议数据（含证书主体、签名算法、签名值等）。
 """
+import base64
+import hashlib
 import struct
 from collections import OrderedDict
 
@@ -283,6 +285,11 @@ def parse_ssh_kexdh_reply(msg: bytes) -> OrderedDict:
         sig = _rs()
         d["服务端主机密钥"] = ks.hex().upper() if ks else "(空)"
         d["服务端主机密钥长度"] = "%d 字节" % len(ks)
+        if ks:
+            # OpenSSH 风格指纹（TOFU 比对用）：SHA256:base64(sha256(K_S))
+            fp = base64.b64encode(hashlib.sha256(ks).digest()).decode("ascii").rstrip("=")
+            d["主机密钥指纹 (SHA256)"] = "SHA256:%s" % fp
+            d["主机密钥位数"] = _ssh_hostkey_bits(ks) or "-"
         # K_S 首串即主机密钥算法格式（如 ssh-rsa / ssh-ed25519）
         if len(ks) >= 4:
             kn = int.from_bytes(ks[:4], "big")
@@ -306,6 +313,33 @@ def parse_ssh_kexdh_reply(msg: bytes) -> OrderedDict:
     except Exception as e:
         d["错误"] = str(e)
     return d
+
+
+def _ssh_hostkey_bits(ks: bytes):
+    """从主机密钥 blob 估算密钥位数（RSA 取 modulus 位数，其余 '-')。"""
+    try:
+        n = int.from_bytes(ks[:4], "big")
+        fmt = ks[4:4 + n].decode("ascii", "replace")
+        off = 4 + n
+        if fmt in ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512"):
+            # string e + mpint n
+            e_len = int.from_bytes(ks[off:off + 4], "big")
+            off += 4 + e_len
+            n_len = int.from_bytes(ks[off:off + 4], "big")
+            off += 4
+            n_bytes = ks[off:off + n_len]
+            if n_bytes[:1] == b"\x00":
+                n_bytes = n_bytes[1:]
+            return "%d 位 RSA" % (len(n_bytes) * 8)
+        if fmt.startswith("ecdsa-sha2-"):
+            curve_len = int.from_bytes(ks[off:off + 4], "big")
+            curve = ks[off + 4:off + 4 + curve_len].decode("ascii", "replace")
+            return curve
+        if fmt == "ssh-ed25519":
+            return "Ed25519"
+        return fmt
+    except Exception:
+        return None
 
 
 def _frame_ranges(nums):
@@ -485,12 +519,24 @@ def _ssh_negotiation_summary(msgs, cdir_txt, stream_no=None, frames=None):
         fd["服务端主机密钥格式"] = rf.get("服务端主机密钥格式") or "-"
         fd["服务端签名算法"] = rf.get("服务端签名算法") or "-"
         fd["服务端签名值"] = rf.get("服务端签名值") or "-"
+        fd["主机密钥指纹 (SHA256)"] = rf.get("主机密钥指纹 (SHA256)") or "-"
+        fd["主机密钥位数"] = rf.get("主机密钥位数") or "-"
     else:
         fd["服务端交换值"] = "-"
         fd["服务端主机密钥"] = "-"
         fd["服务端主机密钥格式"] = "-"
         fd["服务端签名算法"] = "-"
         fd["服务端签名值"] = "-"
+        fd["主机密钥指纹 (SHA256)"] = "-"
+        fd["主机密钥位数"] = "-"
+
+    # 验签可验证性判定：SSH 服务端签名覆盖交换哈希 H，其中 K 为 DH 共享密钥、不在报文中
+    fd["验签结果"] = "不可用"
+    fd["验签详情"] = (
+        "SSH 服务端签名覆盖交换哈希 H = HASH(V_C ∥ V_S ∥ I_C ∥ I_S ∥ K_S ∥ e ∥ f ∥ K)，"
+        "其中 K 为 Diffie-Hellman 共享密钥、不在报文中，被动抓包无法重算 H，"
+        "因此无法像 CSSH / TLS / TLCP 那样直接验证签名；"
+        "可改用主机密钥指纹（SHA256，见上）与已知值比对（TOFU）确认服务端身份")
 
     if stream_no is not None:
         fd["会话过滤器"] = "tcp.stream == %d" % stream_no

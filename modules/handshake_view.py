@@ -21,6 +21,86 @@
 
 from scapy.all import IP, IPv6, TCP
 
+import re as _re
+
+
+# ------------------------------------------------------------ 展示样式（块状卡片 / 代码块）
+# Qt 富文本（QTextBrowser/QLabel）只支持 HTML 子集：不支持 border-radius / box-shadow /
+# 渐变，padding 仅对表格单元格生效 —— 因此「卡片」统一用 table + bgcolor + cellpadding 实现，
+# 长数据（HEX 等）再嵌一层浅灰底表格作为「代码块」，视觉效果稳定。
+# 参考：https://doc.qt.io/qt-6/richtext-html-subset.html
+
+CARD_BORDER = "#E2E8F0"
+CARD_BG = "#FFFFFF"
+CODE_BG = "#F1F5F9"
+LABEL_COLOR = "#64748B"
+ACCENT_BLUE = "#3B82F6"
+ACCENT_GREEN = "#22C55E"
+ACCENT_AMBER = "#F59E0B"
+ACCENT_RED = "#EF4444"
+
+# 兼容旧引用（证书详情等）：
+BLK_CSS = "border:1px solid %s;margin-top:4px;margin-bottom:4px" % CARD_BORDER
+LBL_CSS = "color:%s;font-size:11px" % LABEL_COLOR
+CODE_CSS = ("font-family:Consolas,'Courier New',monospace;font-size:11px;"
+            "color:#0F172A;word-break:break-all;white-space:pre-wrap")
+VAL_CSS = "color:#0F172A;font-size:12px"
+
+
+def _wrap_hex(hex_str, width: int = 64, sep: str = "<br>") -> str:
+    """长 HEX 折行（协商总结不截断数据，统一按固定字符数换行展示）。"""
+    s = str(hex_str or "")
+    if not s:
+        return ""
+    return sep.join(s[i:i + width] for i in range(0, len(s), width))
+
+
+def _card(inner_html: str, accent: str = None, bg: str = CARD_BG) -> str:
+    """块状卡片：1px 边框 + 左侧色条 accent——用表格实现以保证 Qt 富文本渲染。"""
+    accent_td = ("<td width='4' bgcolor='%s'></td>" % accent) if accent else ""
+    return ("<table width='100%' cellspacing='0' cellpadding='0' "
+            "style='border:1px solid {b};margin-top:4px;margin-bottom:4px'>"
+            "<tr>{a}<td bgcolor='{g}' style='padding:6px 9px'>{i}</td></tr></table>"
+            .format(b=CARD_BORDER, a=accent_td, g=bg, i=inner_html))
+
+
+def _code_block(label, text, note: str = "", color: str = LABEL_COLOR,
+                accent: str = ACCENT_BLUE) -> str:
+    """代码块卡片：标签 + 浅灰底等宽数据块（长 HEX 自动折行、完整不省略）。"""
+    from html import escape
+    note_html = ("<span style='color:#94A3B8;font-size:11px'>　%s</span>" % escape(note)) if note else ""
+    code = ("<table width='100%' cellspacing='0' cellpadding='0' bgcolor='{g}'>"
+            "<tr><td style='padding:6px 8px'><span style='{c}'>{t}</span></td></tr></table>"
+            .format(g=CODE_BG, c=CODE_CSS, t=_wrap_hex(text)))
+    return _card("<span style='color:%s;font-size:11px'>%s</span>%s%s"
+                 % (color, escape(label), note_html, code), accent=accent)
+
+
+def _kv_block(label, value_html, color: str = LABEL_COLOR, accent: str = None) -> str:
+    """普通参数卡片：标签 + 值（值可含 HTML）。"""
+    from html import escape
+    return _card("<span style='color:%s;font-size:11px'>%s</span><br>"
+                 "<span style='%s'>%s</span>"
+                 % (color, escape(label), VAL_CSS, value_html), accent=accent)
+
+
+def _plain_block(value_html, color: str = LABEL_COLOR) -> str:
+    """无标签卡片（说明性文字）。"""
+    return _card("<span style='color:%s'>%s</span>" % (color, value_html))
+
+
+def _badge(text_html, bg: str, fg: str, border: str = None) -> str:
+    """行内徽标（方形，Qt 富文本不支持圆角）。"""
+    b = ("border:1px solid %s;" % border) if border else ""
+    return ("<span style='background-color:%s;color:%s;%spadding:1px 6px;"
+            "font-weight:bold'>%s</span>" % (bg, fg, b, text_html))
+
+
+def _is_hex_text(s: str) -> bool:
+    return bool(s) and len(s) >= 32 and _re.fullmatch(r"[0-9A-Fa-f]+", s) is not None
+
+
+
 
 def _norm_key(p):
     """把数据包归一到流 key（与 tls_parser._flow_key 一致）。"""
@@ -119,6 +199,44 @@ def messages_to_events(messages, cdir=None):
     return evs
 
 
+def _verify_badge(ok):
+    """验签结论徽标（通过 ✓ / 失败 ✗ / 未能验签 ⚠）。"""
+    if ok == "通过":
+        return _badge("验签通过 ✓", "#DCFCE7", "#15803D", "#BBF7D0")
+    if ok == "失败":
+        return _badge("验签失败 ✗", "#FEE2E2", "#B91C1C", "#FECACA")
+    return _badge("未能验签 ⚠", "#FEF3C7", "#92400E", "#FDE68A")
+
+
+def _verify_html(fd, title):
+    """服务端/客户端身份鉴别块（与 CSSH 的 SM2 验签版式一致，参数块状展示）。"""
+    from html import escape
+    ok = fd.get("验签结果")
+    if not ok:
+        return ""
+    head = _card("<b style='color:#1F2937'>%s</b>　%s"
+                 % (escape(title), _verify_badge(ok)), accent=ACCENT_GREEN if ok == "通过" else
+                 (ACCENT_RED if ok == "失败" else ACCENT_AMBER))
+    blocks = []
+    for label, key in (("签名算法", "签名算法"), ("签名证书", "签名证书"),
+                       ("被签入证书（加密证书）", "被签名证书")):
+        if fd.get(key):
+            blocks.append(_kv_block(label, escape(str(fd[key]))))
+    if fd.get("待签名数据"):
+        blocks.append(_kv_block("待签名数据组成", escape(str(fd["待签名数据"]))))
+    if fd.get("待签名数据HEX"):
+        hx = str(fd["待签名数据HEX"])
+        blocks.append(_code_block("待签名数据（%d 字节，完整 HEX）" % (len(hx) // 2), hx))
+    if fd.get("签名值"):
+        sv = str(fd["签名值"])
+        blocks.append(_code_block("签名值（%d 字节，完整 HEX）" % (len(sv) // 2), sv))
+    if fd.get("签名公钥"):
+        blocks.append(_kv_block("签名公钥", escape(str(fd["签名公钥"]))))
+    if fd.get("验签详情"):
+        blocks.append(_kv_block("验签结果", escape(str(fd["验签详情"]))))
+    return head + "".join(blocks)
+
+
 def _ssh_summary_html(fd):
     """把“SSH 协商算法”汇总字段渲染为参考工具风格的报告块。
 
@@ -156,27 +274,35 @@ def _ssh_summary_html(fd):
             sup.append("%s：-" % name)
         else:
             items = [x for x in str(v).split(" | ") if x.strip()]
-            sup.append("%s：%d 项（%s…）" % (name, len(items), items[0][:40]))
+            sup.append("%s：%d 项（%s）" % (name, len(items), esc("、".join(items))))
     rows.append("<span style='color:#4b5563'>服务端支持：</span>" + "　".join(sup))
 
     params = []
-    for name, key in (("客户端交换值", "客户端交换值"), ("服务端交换值", "服务端交换值")):
-        v = fd.get(key)
-        if v not in (None, "", "-"):
-            params.append("%s <span style='font-family:Consolas'>%s…</span>" % (name, esc(str(v))[:48]))
     sa = fd.get("服务端签名算法")
     if sa not in (None, "", "-"):
         params.append("服务端签名算法 %s" % esc(str(sa)))
-    hk = fd.get("服务端主机密钥格式")
-    hkv = fd.get("服务端主机密钥")
-    if hk not in (None, "", "-") or hkv not in (None, "", "-"):
-        if hk not in (None, "", "-"):
-            params.append("服务端主机密钥（%s）<span style='font-family:Consolas'>%s…</span>"
-                          % (esc(str(hk)), esc(str(hkv or ""))[:48]))
-        else:
-            params.append("服务端主机密钥 <span style='font-family:Consolas'>%s…</span>" % esc(str(hkv))[:48])
+    fp = fd.get("主机密钥指纹 (SHA256)")
+    bits = fd.get("主机密钥位数")
+    if fp not in (None, "", "-"):
+        params.append("主机密钥指纹（SHA256）<span style='font-family:Consolas'>%s</span>%s"
+                      % (esc(str(fp)), ("（%s）" % esc(str(bits))) if bits not in (None, "", "-") else ""))
     rows.append("<span style='color:#4b5563'>密钥协商参数：</span>" +
                 ("　".join(params) if params else "（未捕获到 KEXDH 消息）"))
+
+    # 长数据统一块状展示（完整、不省略）
+    for name, key in (("客户端交换值", "客户端交换值"), ("服务端交换值", "服务端交换值")):
+        v = fd.get(key)
+        if v not in (None, "", "-"):
+            rows.append(_code_block("%s（%d 字节，完整 HEX）" % (name, len(str(v)) // 2), str(v)))
+    hk = fd.get("服务端主机密钥格式")
+    hkv = fd.get("服务端主机密钥")
+    if hkv not in (None, "", "-"):
+        label = "服务端主机密钥%s（完整 HEX）" % (("（%s）" % str(hk)) if hk not in (None, "", "-") else "")
+        rows.append(_code_block(label, str(hkv)))
+
+    # 服务端身份鉴别（SSH 主机密钥签名）：被动抓包无法重算交换哈希 H，如实给出结论与原因
+    if fd.get("验签结果"):
+        rows.append(_verify_html(fd, "服务端身份鉴别（SSH 主机密钥签名）"))
 
     loc = fd.get("会话过滤器")
     fr = fd.get("精确帧过滤器")
@@ -237,23 +363,18 @@ def _cssh_summary_inner(client, server, events):
     rs = rep.get("random-server") or ""
     sig = rep.get("签名值 (DER)") or ""
     if rc or rs or sig:
-        ok = rep.get("验签结果")
-        if ok == "通过":
-            badge = "<span style='background:#DCFCE7;color:#15803D;border-radius:4px;padding:1px 6px;font-weight:bold'>验签通过 ✓</span>"
-        elif ok == "失败":
-            badge = "<span style='background:#FEE2E2;color:#B91C1C;border-radius:4px;padding:1px 6px;font-weight:bold'>验签失败 ✗</span>"
-        else:
-            badge = "<span style='background:#FEF3C7;color:#92400E;border-radius:4px;padding:1px 6px;font-weight:bold'>未能验签 ⚠</span>"
-        rows.append("<b>服务端身份鉴别（SM2 验签，用户标识 1234567812345678）</b>%s<br>"
-                    "&nbsp;&nbsp;random-client = <code>%s</code><br>"
-                    "&nbsp;&nbsp;random-server = <code>%s</code><br>"
-                    "&nbsp;&nbsp;待签名数据 M = rc ∥ rs（16 字节）" % (badge, esc(rc), esc(rs)))
-        if sig:
-            rows.append("&nbsp;&nbsp;签名值 (DER) = <code>%s</code>" % esc(sig))
         pu = rep.get("签名公钥") or ""
-        if pu:
-            rows.append("&nbsp;&nbsp;签名公钥（签名证书 SPKI）：<code>%s…</code>" % esc(pu[:48]))
-        rows.append("&nbsp;&nbsp;验签结果：%s" % esc(rep.get("验签详情") or ""))
+        fdv = {
+            "验签结果": rep.get("验签结果"),
+            "签名算法": "SM2 with SM3（用户标识 1234567812345678）",
+            "签名证书": rep.get("cert1_subject") or "",
+            "待签名数据": "random-client(8) ∥ random-server(8) = 16 字节",
+            "待签名数据HEX": (rc or "") + (rs or ""),
+            "签名值": sig,
+            "签名公钥": ("SM2 公钥点（完整，%d 字节）%s" % (len(pu) // 2, pu)) if pu else "",
+            "验签详情": rep.get("验签详情") or "",
+        }
+        rows.append(_verify_html(fdv, "服务端身份鉴别（SM2 验签）"))
 
     certs = []
     flds = next(iter(f.get("KEX_REPLY", [])), {})
@@ -272,7 +393,8 @@ def _cssh_summary_inner(client, server, events):
     kxfd = next((d for d in f.get("KEX", []) if d.get("enc(K)（SM2 加密主密钥）")), None)
     if kxfd:
         ek = kxfd["enc(K)（SM2 加密主密钥）"]
-        rows.append("enc(K)（SM2 加密主密钥）：<code>%s…</code>（%d 字节）" % (esc(str(ek)[:64]), len(str(ek)) // 2))
+        rows.append(_code_block("enc(K)（SM2 加密主密钥，%d 字节，完整 HEX）" % (len(str(ek)) // 2),
+                                ek))
     return "<br>".join(rows)
 
 
@@ -333,27 +455,38 @@ def _summary_inner(client, server, events, proto=""):
 
     if f_cert:
         rows = []
-        rows.append(("<b>服务端证书</b>·共 %d 张" % chain_n) if chain_n else "<b>服务端证书</b>")
-        add = []
-        if f_cert.get("cert1_subject"):
-            add.append("主体 %s" % esc(f_cert["cert1_subject"]))
-        if f_cert.get("cert1_issuer"):
-            add.append("签发者 %s" % esc(f_cert["cert1_issuer"]))
-        if f_cert.get("cert1_pubkey"):
-            add.append("公钥算法 %s" % esc(f_cert["cert1_pubkey"]))
-        if f_cert.get("cert1_pubkey_curve"):
-            add.append("公钥曲线 %s" % esc(f_cert["cert1_pubkey_curve"]))
-        if f_cert.get("cert1_sig_algorithm"):
-            add.append("签名算法 %s" % esc(f_cert["cert1_sig_algorithm"]))
-        sig = esc(f_cert.get("cert1_sig_value") or "")
-        if sig:
-            add.append("签名值 <span style='font-family:Consolas'>%s</span>" % sig)
-        thumb = esc(f_cert.get("cert1_sha256_thumb") or "")
-        if thumb:
-            add.append("指纹(SHA256) %s" % thumb)
-        rows.append("<br>".join("· " + a for a in add))
-        if chain_n and chain_n > 1:
-            rows.append("<span style='color:#9ca3af'>… 其余 %d 张证书：点击时序图卡片中的「证书 N」按钮逐一查看</span>" % (chain_n - 1))
+        rows.append(("<b>服务端证书</b>·共 %d 张（全部展示）" % chain_n) if chain_n
+                    else "<b>服务端证书</b>")
+        total = chain_n or 1
+        for i in range(1, total + 1):
+            add = []
+            if f_cert.get("cert%d_subject" % i):
+                add.append("主体 %s" % esc(f_cert["cert%d_subject" % i]))
+            if f_cert.get("cert%d_issuer" % i):
+                add.append("签发者 %s" % esc(f_cert["cert%d_issuer" % i]))
+            if f_cert.get("cert%d_pubkey" % i):
+                add.append("公钥算法 %s" % esc(f_cert["cert%d_pubkey" % i]))
+            if f_cert.get("cert%d_pubkey_curve" % i):
+                add.append("公钥曲线 %s" % esc(f_cert["cert%d_pubkey_curve" % i]))
+            if f_cert.get("cert%d_sig_algorithm" % i):
+                add.append("签名算法 %s" % esc(f_cert["cert%d_sig_algorithm" % i]))
+            if f_cert.get("cert%d_key_usage" % i):
+                add.append("密钥用途 %s" % esc(f_cert["cert%d_key_usage" % i]))
+            if f_cert.get("cert%d_serial" % i):
+                add.append("序列号 %s" % esc(f_cert["cert%d_serial" % i]))
+            if f_cert.get("cert%d_not_before" % i) or f_cert.get("cert%d_not_after" % i):
+                add.append("有效期 %s ~ %s" % (esc(f_cert.get("cert%d_not_before" % i) or ""),
+                                             esc(f_cert.get("cert%d_not_after" % i) or "")))
+            sig = str(f_cert.get("cert%d_sig_value" % i) or "")
+            if sig:
+                add.append(_code_block("证书签名值（%d 字节，完整 HEX）" % (len(sig) // 2), sig))
+            thumb = esc(f_cert.get("cert%d_sha256_thumb" % i) or "")
+            if thumb:
+                add.append("指纹(SHA256) %s" % thumb)
+            if total > 1:
+                rows.append("<b>第 %d 张</b><br>" % i + "<br>".join("· " + a for a in add))
+            else:
+                rows.append("<br>".join("· " + a for a in add))
         ps += "<br>" + "<br>".join(rows)
     else:
         ps += "<br><span style='color:#9ca3af'>未捕获到服务端证书（TLS 1.3 加密握手或缺失流量）</span>"
@@ -373,6 +506,13 @@ def _summary_inner(client, server, events, proto=""):
             parts.append("签名值 <span style='font-family:Consolas'>%s</span>" % sksig)
         ps += "<br><span style='color:#4b5563'>服务端密钥交换（ServerKeyExchange）：</span>" + \
               ("　".join("· " + p for p in parts) if parts else "（未能解析）")
+        # 服务端身份鉴别：ServerKeyExchange 数字签名验签结论
+        if ske.get("验签结果"):
+            ps += "<br>" + _verify_html(ske, "服务端身份鉴别（ServerKeyExchange 签名验证）")
+
+    # 无 ServerKeyExchange（TLS 1.3 / RSA 密钥交换等）：展示可验证性结论与原因
+    if not ske and (f_server or {}).get("验签结果"):
+        ps += "<br>" + _verify_html(f_server, "服务端身份鉴别（签名验证）")
 
     if cv_verify:
         cvp = []
@@ -385,6 +525,8 @@ def _summary_inner(client, server, events, proto=""):
         if cvp:
             ps += "<br><span style='color:#B45309'>客户端 CertificateVerify（身份鉴别）：</span>" + \
                   ("　".join("· " + p for p in cvp))
+        if cv_verify.get("验签结果"):
+            ps += "<br>" + _verify_html(cv_verify, "客户端身份鉴别（CertificateVerify 签名）")
     return ps
 
 
@@ -426,29 +568,32 @@ def _client_auth_inner(events):
         rows = []
         n = certd.get("cert_chain_count") or 1
         if n:
-            rows.append("客户端证书链：%d 张" % n)
-        if certd.get("cert1_subject"):
-            rows.append("主体：%s" % esc(certd["cert1_subject"]))
-        if certd.get("cert1_issuer"):
-            rows.append("签发者：%s" % esc(certd["cert1_issuer"]))
-        if certd.get("cert1_pubkey"):
-            rows.append("公钥算法：%s" % esc(certd["cert1_pubkey"]))
-        if certd.get("cert1_pubkey_curve"):
-            rows.append("公钥曲线：%s" % esc(certd["cert1_pubkey_curve"]))
-        if certd.get("cert1_sig_algorithm"):
-            rows.append("签名算法：%s" % esc(certd["cert1_sig_algorithm"]))
-        csig = esc(certd.get("cert1_sig_value") or "")
-        if csig:
-            rows.append("签名值：<span style='font-family:Consolas'>%s</span>" % csig)
-        if certd.get("cert1_ext_key_usage"):
-            rows.append("证书用途(EKU)：%s" % esc(certd["cert1_ext_key_usage"]))
-        if certd.get("cert1_key_usage"):
-            rows.append("密钥用途：%s" % esc(certd["cert1_key_usage"]))
-        if certd.get("cert1_basic_constraints"):
-            rows.append("CA约束：%s" % esc(certd["cert1_basic_constraints"]))
+            rows.append("客户端证书链：%d 张（全部展示）" % n)
+        for i in range(1, (n or 1) + 1):
+            pre = "第 %d 张 · " % i if (n or 1) > 1 else ""
+            add = []
+            for label, key in (("主体", "cert%d_subject"), ("签发者", "cert%d_issuer"),
+                               ("公钥算法", "cert%d_pubkey"), ("公钥曲线", "cert%d_pubkey_curve"),
+                               ("签名算法", "cert%d_sig_algorithm"),
+                               ("证书用途(EKU)", "cert%d_ext_key_usage"),
+                               ("密钥用途", "cert%d_key_usage"),
+                               ("CA约束", "cert%d_basic_constraints"),
+                               ("序列号", "cert%d_serial")):
+                v = certd.get(key % i)
+                if v:
+                    add.append("%s：%s" % (label, esc(v)))
+            csig = str(certd.get("cert%d_sig_value" % i) or "")
+            if csig:
+                add.append(_code_block("证书签名值（%d 字节，完整 HEX）" % (len(csig) // 2), csig))
+            th = esc(certd.get("cert%d_sha256_thumb" % i) or "")
+            if th:
+                add.append("指纹(SHA256)：%s" % th)
+            if add:
+                rows.append(pre + "；".join(add) if (n or 1) <= 1
+                            else pre + "<br>" + "<br>".join("　· " + a for a in add))
         if rows:
             ps += ("<span style='color:#B45309'>客户端出示自身证书（本次双向鉴别的反向阶段）：</span><br>"
-                   + "　".join("· " + r for r in rows))
+                   + "<br>".join("· " + r for r in rows))
     if verify:
         if ps:
             ps += "<br>"
@@ -460,6 +605,8 @@ def _client_auth_inner(events):
             ps += "<br>· 客户端签名值：<span style='font-family:Consolas'>%s</span>" % esc(sig)
         if not sch and not sig:
             ps += "· CertificateVerify（签名值与方案见时序图卡片）"
+        if verify.get("验签结果"):
+            ps += "<br>" + _verify_html(verify, "客户端身份鉴别（CertificateVerify 签名）")
     if certd is None and verify is None:
         ps += "<span style='color:#9ca3af'>该阶段无客户端证书（非客户端鉴别）</span>"
     return ps
@@ -501,6 +648,42 @@ def event_detail_text(ev) -> str:
     else:
         lines.append("摘要：%s" % ev.get("detail", ""))
     return "\n".join(lines)
+
+
+def event_detail_html(ev) -> str:
+    """点击时序图消息后的「关键参数」块状 HTML（每部分参数一个卡片，长数据用代码块）。"""
+    from html import escape
+    dir_txt = "客户端 → 服务端" if ev.get("dir") == "c->s" else "服务端 → 客户端"
+    meta = ["方向：%s" % escape(dir_txt), "协议：%s" % escape(str(ev.get("kind", "")))]
+    if ev.get("no") is not None:
+        meta.append("原始包号：%s" % escape(str(ev["no"])))
+    if ev.get("ts") is not None:
+        meta.append("时间(s)：%.4f" % ev["ts"])
+    head = _card("<b style='font-size:13px;color:#1F2937'>〔#%s〕%s</b><br>"
+                 "<span style='color:%s;font-size:11px'>%s</span>"
+                 % (escape(str(ev.get("seq", ""))), escape(str(ev.get("title", ""))),
+                    LABEL_COLOR, "　".join(meta)), accent=ACCENT_BLUE)
+    fields = ev.get("fields") or []
+    blocks = []
+    if not fields:
+        blocks.append(_plain_block(escape(str(ev.get("detail", "")))))
+    for k, v in fields:
+        if k == "der_hex":
+            continue
+        disp = k[:-5] if k.endswith("_full") or k.endswith("_list") else k
+        s = str(v)
+        if " | " in s:
+            parts = [x.strip() for x in s.split(" | ") if x.strip()]
+            items = "".join(
+                "<div style='%s'>%d. %s</div>" % (CODE_CSS, i, escape(p))
+                for i, p in enumerate(parts, 1))
+            blocks.append(_kv_block("%s（%d 项）" % (disp, len(parts)), items))
+        elif _is_hex_text(s):
+            blocks.append(_code_block(disp, s))
+        else:
+            blocks.append(_kv_block(disp, escape(s)))
+    return ("<div style='font-family:\"Microsoft YaHei UI\",\"Microsoft YaHei\";"
+            "font-size:12px;color:#374151'>%s%s</div>" % (head, "".join(blocks)))
 
 
 def _negotiation_stage(title, side):

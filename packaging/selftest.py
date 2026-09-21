@@ -55,6 +55,43 @@ def check_cssh():
     print("SELFTEST cssh ok")
 
 
+def check_negotiation_verify():
+    """协商过程验签自检：生成自签 P-256 证书，构造 TLS1.2 SKE 并验证签名结论。"""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from modules import negotiation_verify as NV
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "selftest")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    der = cert.public_bytes(serialization.Encoding.DER)
+
+    cr, sr, params = b"\x01" * 32, b"\x02" * 32, bytes(range(5))
+    sig = key.sign(cr + sr + params, ec.ECDSA(hashes.SHA256()))
+    msgs = [
+        {"title": "ClientHello", "dir": "c->s", "fields": {}, "_raw": {"random": cr}},
+        {"title": "ServerHello", "dir": "s->c", "fields": {}, "_raw": {"random": sr}},
+        {"title": "Certificate", "dir": "s->c",
+         "fields": {"cert_chain_count": 1, "cert1_der_hex": der.hex()}},
+        {"title": "ServerKeyExchange", "dir": "s->c", "fields": {"signature": sig.hex()},
+         "_raw": {"params": params, "scheme": 0x0403, "sig": sig}},
+    ]
+    NV.attach_flow_verify(msgs, "TLS")
+    ske = msgs[3]["fields"]
+    assert ske.get("验签结果") == "通过", "TLS1.2 SKE 验签自检失败：%s" % ske.get("验签详情")
+    print("SELFTEST negotiation_verify ok")
+
+
 def check_gui():
     if os.environ.get("SELFTEST_SKIP_GUI"):
         print("SELFTEST gui skipped")
@@ -74,6 +111,7 @@ def main():
     check_gmssl()
     check_scapy()
     check_cssh()
+    check_negotiation_verify()
     check_gui()
     print("SELFTEST ALL OK")
 

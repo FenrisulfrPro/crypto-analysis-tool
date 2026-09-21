@@ -1,0 +1,48 @@
+stages:
+  - build
+
+# Linux x86_64：构建与门禁逻辑都放在 packaging/ci_linux_build.sh，
+# 便于与 GitHub Actions 复用同一套流程。
+linux-x86_64:
+  stage: build
+  image: openeuler/openeuler:24.03
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+  script:
+    - >-
+      dnf install -y binutils glib2 fontconfig freetype dbus-libs libxkbcommon
+      libxkbcommon-x11 mesa-libGL mesa-libEGL mesa-dri-drivers libX11 libxcb
+      xcb-util-keysyms xcb-util-wm xcb-util-image xcb-util-renderutil
+      xorg-x11-server-Xvfb >/dev/null
+    - bash packaging/ci_linux_build.sh
+  artifacts:
+    name: CryptoAnalysisTool-linux-x86_64
+    paths:
+      - CryptoAnalysisTool-linux-x86_64.tar.gz
+    expire_in: never
+
+windows-x64:
+  stage: build
+  tags:
+    - windows
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      when: manual
+      allow_failure: true
+  script:
+    - python -m pip install --no-cache-dir -r packaging/requirements-build.txt
+    - python packaging/selftest.py
+    - >-
+      python -m PyInstaller --noconfirm --clean --windowed --name CryptoAnalysisTool
+      --distpath dist --workpath build --specpath build
+      --collect-submodules scapy
+      --hidden-import modules.negotiation_verify
+      --exclude-module matplotlib --exclude-module numpy --exclude-module PIL
+      --exclude-module tkinter --exclude-module _tkinter
+      main.py
+    - Compress-Archive -Path dist/CryptoAnalysisTool -DestinationPath CryptoAnalysisTool-win-x64.zip
+  artifacts:
+    name: CryptoAnalysisTool-win-x64
+    paths:
+      - CryptoAnalysisTool-win-x64.zip
+    expire_in: never

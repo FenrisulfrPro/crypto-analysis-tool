@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""产物自包含性门禁：对 dist 内所有 ELF 执行 ldd，禁止出现白名单之外的 "not found"。
+"""产物自包含性门禁（两类检查）。
 
-白名单见 target_libs：glibc 家族、目标系统自带库、显卡/内核驱动类。
-若某个未随包携带、又不在白名单中的库缺失（例如漏掉 libxcb-cursor.so.0），
-本门禁会使 CI 失败，避免打出「构建机可用、目标机崩溃」的包。
+1) 缺失检查：对 dist 内所有 ELF 执行 ldd，禁止出现白名单之外的 "not found"。
+   白名单见 target_libs：glibc 家族、目标系统自带库、显卡/内核驱动类。
+   若某个未随包携带、又不在白名单中的库缺失（例如漏掉 libxcb-cursor.so.0），
+   本门禁会使 CI 失败，避免打出「构建机可用、目标机崩溃」的包。
+
+2) 成套检查（v2.1 段错误教训）：禁止随包携带 X11/XKB 家族中「白名单之外」的库，
+   即构建机拷贝的 libxkbcommon* / libX11-xcb / libXext 等；只允许
+   target_libs.VENDORED_X11 里、由 vendor 脚本从目标发行版(buster)取出的成套库。
 
 使用：python packaging/check_selfcontained.py dist/CryptoAnalysisTool
 """
@@ -12,9 +17,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from target_libs import is_allowed_system, is_elf  # noqa: E402
+from target_libs import (is_allowed_system, is_elf, is_forbidden_bundled,  # noqa: E402
+                         VENDORED_X11)
 
-MUST_HAVE = ["libxcb-cursor.so.0"]
+# 必须随包携带的库：target_libs 中声明的 X11/XKB 成套库（buster 版本）
+MUST_HAVE = sorted(VENDORED_X11)
 
 
 def search_paths(root):
@@ -53,6 +60,20 @@ def main():
         if not is_elf(p):
             print("缺少必需的随包库: %s" % p)
             return 3
+
+    # 成套检查：X11/XKB 家族只允许携带 VENDORED_X11（目标发行版版本）
+    forbidden = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if is_forbidden_bundled(fn):
+                forbidden.append(os.path.join(dirpath, fn))
+    if forbidden:
+        print("禁止随包携带的 X11/XKB 系统库（构建机版本，必须剔除）：%d 个" % len(forbidden))
+        for p in sorted(forbidden):
+            print("  ", p)
+        print("说明：这类库必须「成套打包或整套不打」，构建机拷贝会与目标机版本错配"
+              "（v2.1 libxkbcommon-x11 段错误即此类问题）。")
+        return 5
 
     scanned = 0
     violations = {}

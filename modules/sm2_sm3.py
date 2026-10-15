@@ -11,6 +11,43 @@ from gmssl.sm2 import default_ecc_table
 DEFAULT_ID = "1234567812345678"
 
 
+# ---------------------------------------------------------------- gmssl 公钥前缀缺陷收敛
+# 背景（tp10ssh04.pcap 实测）：
+#   ① CryptSM2.__init__ 用 public_key.lstrip("04")——按字符集剥离开头的 '0'/'4'，
+#      当公钥 X 坐标以 0x4x/0x0x 开头时会把 "04||X||Y" 剥成 127/129 字符奇数长，
+#      _sm3_z 内 binascii.a2b_hex 抛 "Odd-length string"，验签直接不可用；
+#   ② _kg() 对 128 字符 x||y 若恰以 "04" 开头会误剥 2 字符（概率 ~1/256），导致验签/加密失败。
+# 统一做法：公钥一律按 128 字符 x||y 存放（构造后直接赋值，绕过 lstrip），
+# 且 _kg 仅在点确实带 "04" 前缀（130 字符）时才剥离。
+
+def _pub_xy_128(pub) -> str:
+    """把 '04||X||Y'(130) 或 'x||y'(128) 规范化为 128 字符 x||y；非法返回 ''。"""
+    s = str(pub or "").strip()
+    if len(s) == 130 and s[:2] == "04":
+        s = s[2:]
+    if len(s) == 128 and all(c in "0123456789abcdefABCDEF" for c in s):
+        return s.lower()
+    return ""
+
+
+class _CryptSM2Compat(sm2.CryptSM2):
+    """gmssl CryptSM2 兼容子类：规避上述两处公钥前缀缺陷。"""
+
+    def _kg(self, k, Point):
+        if isinstance(Point, str) and len(Point) == 130 and Point[:2] == "04":
+            Point = Point[2:]
+        return super()._kg(k, Point)
+
+
+def new_sm2(public_hex: str = "", private_key: str = ""):
+    """规范化公钥（128 字符 x||y）后构造 CryptSM2（本模块与解析模块共用）。"""
+    c = _CryptSM2Compat(private_key=private_key or "", public_key="", asn1=False)
+    xy = _pub_xy_128(public_hex)
+    if xy:
+        c.public_key = xy
+    return c
+
+
 def sm3_hex(data: bytes) -> str:
     """计算 SM3 摘要，返回 64 位小写 hex"""
     return sm3.sm3_hash(func.bytes_to_list(data))
@@ -29,7 +66,13 @@ def sm2_sign(data: bytes, priv_hex: str, pub_hex: str, k_hex: str = None) -> str
     """SM2-with-SM3 签名，返回 r||s 拼接的 128 位 hex"""
     if not priv_hex or not pub_hex:
         raise ValueError("请先填写或生成私钥与公钥")
-    c = sm2.CryptSM2(private_key=priv_hex.strip(), public_key=pub_hex.strip(), asn1=False)
+    xy = _pub_xy_128(pub_hex)
+    if not xy:
+        try:
+            xy = parse_pubkey(pub_hex)
+        except Exception:
+            xy = ""
+    c = new_sm2(xy, priv_hex.strip())
     sig = c.sign_with_sm3(data, k_hex.strip() if k_hex and k_hex.strip() else None)
     if not sig:
         raise ValueError("签名失败，请尝试更换随机数 K")
@@ -40,7 +83,7 @@ def sm2_verify(data: bytes, sig_hex: str, pub_hex: str) -> bool:
     """SM2-with-SM3 验签（兼容旧接口：data=bytes，sig=r||s 128 hex，pub=x||y 128 hex）"""
     if not pub_hex:
         raise ValueError("请填写公钥")
-    c = sm2.CryptSM2(private_key='', public_key=pub_hex.strip(), asn1=False)
+    c = new_sm2(pub_hex)
     try:
         return bool(c.verify_with_sm3(sig_hex.strip(), data))
     except Exception:
@@ -50,7 +93,7 @@ def sm2_verify(data: bytes, sig_hex: str, pub_hex: str) -> bool:
 def sm2_encrypt(data: bytes, pub_hex: str) -> str:
     """SM2 公钥加密（GM/T 0003.4，C1C3C2 密文格式），返回密文 hex。"""
     pub_xy = parse_pubkey(pub_hex)
-    c = sm2.CryptSM2(private_key='', public_key=pub_xy, ecc_table=default_ecc_table)
+    c = new_sm2(pub_xy)
     return c.encrypt(data).hex()
 
 
@@ -67,7 +110,7 @@ def sm2_decrypt(cipher_hex: str, priv_hex: str) -> bytes:
     if len(ct) < 97:
         raise ValueError("SM2 密文(C1C3C2)长度至少 97 字节，实际 %d 字节——请确认输入的是密文而非明文"
                          % len(ct))
-    c = sm2.CryptSM2(private_key=priv_hex.strip(), public_key='', ecc_table=default_ecc_table)
+    c = new_sm2("", priv_hex.strip())
     raw = c.decrypt(ct)
     if not raw:
         raise ValueError("SM2 解密失败：私钥与密文不匹配，或密文被篡改")
@@ -309,7 +352,7 @@ def sm2_verify_auto(msg_text: str, sig_text: str, pub_text: str,
     try:
         za = _sm2_z(pub_xy, id_bytes)
         e = sm3_hex(bytes.fromhex(za) + msg)
-        c = sm2.CryptSM2(private_key='', public_key=pub_xy, asn1=False)
+        c = new_sm2(pub_xy)
         ok = bool(c.verify(sig_rs, bytes.fromhex(e)))
     except Exception as ex:
         return False, "验签执行异常：%s" % ex
@@ -352,7 +395,7 @@ def sm2_verify_ex(msg: bytes, sig_text: str, pub_text: str,
             za = _sm2_z(pub_xy, id_bytes)
             e = sm3_hex(bytes.fromhex(za) + msg)
             log.append("Z 值: %s" % za)
-        c = sm2.CryptSM2(private_key='', public_key=pub_xy, asn1=False)
+        c = new_sm2(pub_xy)
         ok = bool(c.verify(sig_rs, bytes.fromhex(e)))
     except Exception as ex:
         return False, "验签执行异常：%s" % ex

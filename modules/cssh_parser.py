@@ -311,9 +311,13 @@ def _derive_sign_raw(sig_der):
 
 
 def _sm2_verify(sign_der, message, pubkey_hex):
-    """SM2 验签（默认用户标识 1234567812345678）。返回 (ok, detail)。"""
+    """SM2 验签（默认用户标识 1234567812345678）。返回 (ok, detail)。
+
+    公钥统一走 sm2_sm3.new_sm2（按 128 字符 x||y 存放并规避 gmssl 的
+    public_key.lstrip("04") 缺陷——该缺陷会把 "044d…" 这类公钥剥成奇数长度，
+    导致验签抛 "Odd-length string"；tp10ssh04.pcap 实测）。"""
     try:
-        from gmssl.sm2 import CryptSM2, default_ecc_table
+        from .sm2_sm3 import new_sm2 as _new_sm2
     except Exception:
         return None, "未安装 gmssl 库，无法验签（pip install gmssl）"
     raw = _derive_sign_raw(sign_der)
@@ -322,8 +326,7 @@ def _sm2_verify(sign_der, message, pubkey_hex):
     if not pubkey_hex:
         return None, "未能从签名证书提取 SM2 公钥点"
     try:
-        sm2 = CryptSM2(private_key=None, public_key=pubkey_hex,
-                       ecc_table=default_ecc_table)
+        sm2 = _new_sm2(pubkey_hex)
         ok = sm2.verify_with_sm3(raw.hex(), message)
         return bool(ok), "通过" if ok else "失败"
     except Exception as e:

@@ -2317,16 +2317,28 @@ class PcapTab(QWidget):
             self.flow_combo.addItem(st["label"], i)
             if select_key is not None and st.get("phases") and st["phases"][0].get("key") == select_key:
                 sel = i
+        # 默认选中：优先国密（CSSH / TLCP），否则按包序第一个（国密场景更常用）
+        if sel < 0:
+            sel = next((i for i, st in enumerate(sets_)
+                        if st.get("proto") in ("CSSH", "TLCP")), 0 if sets_ else -1)
         self.flow_combo.setEnabled(len(sets_) > 0)
         self.flow_combo.blockSignals(False)
         bidir = any(len(s.get("phases") or []) > 1 for s in sets_)
-        nflow = len(streams)
+        protos = "、".join(sorted({s.get("proto", "?") for s in sets_}))
+        n_incomplete = sum(1 for s in sets_ if s.get("incomplete"))
         if bidir:
-            self.hs_hint.setText("② 检测到 TLCP <b>双向身份鉴别</b>：①服务端鉴别 → ②客户端鉴别（客户端出示自身证书）"
-                                 "；TLS 仅取首次协商。点消息框或「关键参数」查看详情")
-        elif nflow > 1:
-            self.hs_hint.setText("② 按包序仅展示<b>首个完成密钥协商</b>的会话（其余 %d 个会话忽略）；"
-                                 "TLCP 若检测到客户端出示自身证书则展示双向两段协商" % (nflow - 1))
+            self.hs_hint.setText("② 检测到 TLCP <b>双向身份鉴别</b>：①服务端鉴别 → ②客户端鉴别（客户端出示自身证书）；"
+                                 "已按协议各显示首个完成会话（%s），可用上方下拉切换；点消息框或「关键参数」查看详情"
+                                 % protos)
+        elif len(sets_) > 1:
+            extra = "；另含 %d 条不完整的 CSSH 会话（收到 KEX_REPLY 后未协商出 NEWKEYS）" % n_incomplete \
+                if n_incomplete else ""
+            self.hs_hint.setText("② 已按协议各显示<b>首个完成密钥协商</b>的会话（%s，默认优先选中%s）%s；"
+                                 "可用上方下拉切换；点消息框或「关键参数」查看详情"
+                                 % (protos, "国密", extra))
+        elif len(sets_) == 1 and n_incomplete:
+            self.hs_hint.setText("② 仅识别到 <b>不完整</b>的 CSSH 会话（收到 KEX_REPLY 后未协商出 NEWKEYS）；"
+                                 "点消息框或「关键参数」按钮查看详情")
         else:
             self.hs_hint.setText("② 仅展示 ClientHello → Server Finished 关键协商包；点消息框或「关键参数」按钮查看详情")
         if len(sets_) == 0:

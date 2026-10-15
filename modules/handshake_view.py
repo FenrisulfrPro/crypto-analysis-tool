@@ -898,7 +898,10 @@ def negotiation_sets(flows):
         「双向身份鉴别」→ 该对端展示两段协商：
           ① 服务端鉴别（包序第一个完成）　② 客户端鉴别（客户端出示证书，包序第一个完成）。
         否则只展示单段（包序第一个完成）。
-      - TLS / SSH 只取包序上第一个完成协商的会话（遇到 TLS 只取第一次协商过程）。
+      - TLS / SSH / CSSH：**每个协议各取包序第一个完成协商**的会话，互不挤占
+        （多协议抓包时可同时切换查看；例：tp10ssh04.pcap 同时有大量 TLS 与 CSSH）。
+      - 候补：已收到 KEX_REPLY 但未协商出 NEWKEYS 的「不完整 CSSH 会话」也列入，
+        排在完成会话之后（标为"不完整"）。
 
     返回 list(set)，set 形如
       {"label","proto","client","server","phases":[{"label","key","client","server"}, …]}
@@ -960,21 +963,46 @@ def negotiation_sets(flows):
             "proto": "TLCP", "client": fl0.get("client"), "server": fl0.get("server"),
             "phases": phases,
         })
-    # TLS / SSH：只取包序第一个完成协商的会话（TLCP 已在上方成组，不再单列）
+    # TLS / SSH / CSSH：每个协议各取包序第一个完成协商的会话
+    # （TLCP 已在上方按对端成组，不再单列；这样多协议抓包时不会互相挤掉，
+    #   例：tp10ssh04.pcap 有 119 个 TLS 会话 + 1 个 CSSH 会话，此前只显示 TLS）
+    picked_proto = set()
     for key, fl, evs, fin in completed:
         if key in used or fl.get("proto") == "TLCP":
             continue
         proto = fl.get("proto", "?")
+        if proto in picked_proto:
+            continue
+        picked_proto.add(proto)
         sets_.append({
-            "label": "%s → %s · %s 协商（首次）" % (fl.get("client"), fl.get("server"), proto),
+            "label": "%s → %s · %s 协商（该协议首个完成）" % (fl.get("client"), fl.get("server"), proto),
             "proto": proto, "client": fl.get("client"), "server": fl.get("server"),
             "phases": [{"label": "密钥协商", "key": key,
                         "client": fl.get("client"), "server": fl.get("server")}],
         })
-        break
-    # 不改变相对抓包顺序（按各阶段完成点最小包号升序）
+    # 完成协商的会话按抓包顺序排列（各阶段完成点最小包号升序）
     sets_.sort(key=lambda s: _set_min_fin(s, flows))
-    return sets_
+
+    # 候补：不完整的 CSSH 会话（已收到 KEX_REPLY 但未协商出 NEWKEYS，
+    # 例如客户端在收到应答后即断开），统一排在完成会话之后，便于直接查看
+    # （例：tp10ssh04.pcap 中 No.28535 起的那条会话）。
+    added_keys = {p.get("key") for s in sets_ for p in (s.get("phases") or [])}
+    tail = []
+    for key, fl in (flows or {}).items():
+        if fl.get("proto") != "CSSH" or key in used or key in added_keys:
+            continue
+        if not any((m.get("type") == "KEX_REPLY") for m in (fl.get("messages") or [])):
+            continue
+        tail.append({
+            "label": "%s → %s · CSSH 协商（不完整：收到 KEX_REPLY 后未协商出 NEWKEYS）"
+                     % (fl.get("client"), fl.get("server")),
+            "proto": "CSSH", "client": fl.get("client"), "server": fl.get("server"),
+            "incomplete": True,
+            "phases": [{"label": "密钥协商（不完整）", "key": key,
+                        "client": fl.get("client"), "server": fl.get("server")}],
+        })
+    tail.sort(key=lambda s: _set_min_fin(s, flows))
+    return sets_ + tail
 
 
 def _set_min_fin(aset, flows):

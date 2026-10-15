@@ -141,9 +141,12 @@ def _der_rs(sig_der):
 
 
 def _sm2_verify(sig_der, message, pub_hex):
-    """SM2-with-SM3 验签（默认用户标识）。返回 (ok|None, detail)。"""
+    """SM2-with-SM3 验签（默认用户标识）。返回 (ok|None, detail)。
+
+    公钥统一走 sm2_sm3.new_sm2（按 128 字符 x||y 存放，规避 gmssl 的
+    public_key.lstrip("04") 缺陷——该缺陷对 "04 4d…" 类公钥会剥成奇数长度）。"""
     try:
-        from gmssl.sm2 import CryptSM2, default_ecc_table
+        from .sm2_sm3 import new_sm2 as _new_sm2
     except Exception:
         return None, "未安装 gmssl 库，无法验签（pip install gmssl）"
     raw = _der_rs(sig_der)
@@ -152,7 +155,7 @@ def _sm2_verify(sig_der, message, pub_hex):
     if not pub_hex:
         return None, "未能从证书提取 SM2 公钥点"
     try:
-        sm2 = CryptSM2(private_key=None, public_key=pub_hex, ecc_table=default_ecc_table)
+        sm2 = _new_sm2(pub_hex)
         ok = bool(sm2.verify_with_sm3(raw.hex(), message))
         return ok, ("SM2 验签通过" if ok else "SM2 验签失败")
     except Exception as e:
